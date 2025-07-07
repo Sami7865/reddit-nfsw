@@ -6,11 +6,7 @@ from discord import app_commands
 from pymongo import MongoClient
 from flask import Flask
 import praw
-from dotenv import load_dotenv
 import threading
-
-# Load .env if local
-load_dotenv()
 
 # Discord bot
 intents = discord.Intents.default()
@@ -18,21 +14,21 @@ intents.message_content = True
 bot = discord.Client(intents=intents)
 tree = app_commands.CommandTree(bot)
 
-# Flask server (for uptime)
+# Flask keep-alive server
 app = Flask(__name__)
 @app.route('/')
 def home():
     return "Bot is alive!"
 threading.Thread(target=lambda: app.run(host="0.0.0.0", port=8080)).start()
 
-# Reddit API
+# Reddit API setup
 reddit = praw.Reddit(
     client_id=os.getenv("CLIENT_ID"),
     client_secret=os.getenv("CLIENT_SECRET"),
     user_agent=os.getenv("USER_AGENT")
 )
 
-# MongoDB
+# MongoDB connection
 mongo = MongoClient(os.getenv("MONGO_URI"))
 db = mongo["nsfw_bot"]
 subs_col = db["subreddit_channels"]
@@ -45,9 +41,7 @@ def fetch_post(subreddit_name):
     posts = list(subreddit.hot(limit=50))
     random.shuffle(posts)
     for post in posts:
-        if not post.over_18:
-            continue
-        if posts_col.find_one({"post_id": post.id}):
+        if not post.over_18 or posts_col.find_one({"post_id": post.id}):
             continue
         if post.url.endswith(('.jpg', '.png', '.gif', '.mp4', '.webm')):
             media_url = post.url
@@ -69,12 +63,15 @@ def fetch_post(subreddit_name):
 @tree.command(name="addsub", description="Link a subreddit to this channel")
 @app_commands.describe(subreddit="Subreddit name")
 async def addsub(interaction: discord.Interaction, subreddit: str):
-    channel_id = interaction.channel_id
-    guild_id = interaction.guild_id
-    if subs_col.find_one({"subreddit": subreddit, "channel_id": channel_id, "guild_id": guild_id}):
+    entry = {
+        "subreddit": subreddit,
+        "channel_id": interaction.channel_id,
+        "guild_id": interaction.guild_id
+    }
+    if subs_col.find_one(entry):
         await interaction.response.send_message("⚠️ Already linked.", ephemeral=True)
     else:
-        subs_col.insert_one({"subreddit": subreddit, "channel_id": channel_id, "guild_id": guild_id})
+        subs_col.insert_one(entry)
         await interaction.response.send_message(f"✅ Linked r/{subreddit} to this channel.", ephemeral=True)
 
 # Slash: Remove subreddit
@@ -91,12 +88,12 @@ async def removesub(interaction: discord.Interaction, subreddit: str):
     else:
         await interaction.response.send_message("❌ Subreddit not linked.", ephemeral=True)
 
-# Slash: Set limit per subreddit-channel
-@tree.command(name="setlimit", description="Set number of posts to send per cycle for a subreddit")
+# Slash: Set post limit
+@tree.command(name="setlimit", description="Set posts per cycle for a subreddit")
 @app_commands.describe(subreddit="Subreddit name", count="Posts per cycle (1–10)")
 async def setlimit(interaction: discord.Interaction, subreddit: str, count: int):
     if count < 1 or count > 10:
-        await interaction.response.send_message("⚠️ Limit must be between 1 and 10.", ephemeral=True)
+        await interaction.response.send_message("⚠️ Limit must be 1–10.", ephemeral=True)
         return
     query = {
         "subreddit": subreddit,
@@ -105,25 +102,24 @@ async def setlimit(interaction: discord.Interaction, subreddit: str, count: int)
     }
     mapping = subs_col.find_one(query)
     if not mapping:
-        await interaction.response.send_message("❌ This subreddit is not linked to this channel.", ephemeral=True)
+        await interaction.response.send_message("❌ Not linked.", ephemeral=True)
         return
-    old_limit = mapping.get("limit", 1)
+    old = mapping.get("limit", 1)
     subs_col.update_one(query, {"$set": {"limit": count}})
     await interaction.response.send_message(
-        f"✅ Limit for **r/{subreddit}** updated in <#{interaction.channel_id}>.\n"
-        f"🔄 Changed from **{old_limit}** → **{count}** post(s) per cycle.",
+        f"✅ r/{subreddit} in <#{interaction.channel_id}> changed: {old} → {count}.",
         ephemeral=True
     )
 
-# Slash: Set interval per guild
-@tree.command(name="setinterval", description="Set auto-post interval (admins only)")
+# Slash: Set interval (per server)
+@tree.command(name="setinterval", description="Set auto-post interval (admin only)")
 @app_commands.describe(minutes="Minutes between posts (1–1440)")
 async def setinterval(interaction: discord.Interaction, minutes: int):
     if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ Admin only.", ephemeral=True)
+        await interaction.response.send_message("❌ Admins only.", ephemeral=True)
         return
     if minutes < 1 or minutes > 1440:
-        await interaction.response.send_message("⚠️ Must be between 1 and 1440 minutes.", ephemeral=True)
+        await interaction.response.send_message("⚠️ 1–1440 min only.", ephemeral=True)
         return
     intervals_col.update_one(
         {"guild_id": interaction.guild_id},
@@ -133,7 +129,7 @@ async def setinterval(interaction: discord.Interaction, minutes: int):
     await interaction.response.send_message(f"✅ Interval set to {minutes} min.", ephemeral=True)
 
 # Slash: Send manually
-@tree.command(name="send", description="Manually send a post from a subreddit")
+@tree.command(name="send", description="Manually send post from a subreddit")
 @app_commands.describe(subreddit="Subreddit name")
 async def send(interaction: discord.Interaction, subreddit: str):
     await interaction.response.defer(thinking=True)
@@ -150,7 +146,7 @@ async def send(interaction: discord.Interaction, subreddit: str):
         await interaction.followup.send("❌ No content found.")
 
 # Slash: Force post
-@tree.command(name="forcepost", description="Force send a post from a linked subreddit")
+@tree.command(name="forcepost", description="Force send from a linked subreddit")
 @app_commands.describe(subreddit="Subreddit name")
 async def forcepost(interaction: discord.Interaction, subreddit: str):
     entry = subs_col.find_one({"subreddit": subreddit, "guild_id": interaction.guild_id})
@@ -171,8 +167,8 @@ async def forcepost(interaction: discord.Interaction, subreddit: str):
     else:
         await interaction.response.send_message("❌ No content found.", ephemeral=True)
 
-# Slash: List linked subs
-@tree.command(name="listsubs", description="Show all linked subreddits in this server")
+# Slash: List linked subreddits
+@tree.command(name="listsubs", description="List all linked subreddits")
 async def listsubs(interaction: discord.Interaction):
     mappings = subs_col.find({"guild_id": interaction.guild_id})
     embed = discord.Embed(title="📄 Linked Subreddits", color=discord.Color.blurple())
@@ -186,9 +182,9 @@ async def listsubs(interaction: discord.Interaction):
     if found:
         await interaction.response.send_message(embed=embed, ephemeral=True)
     else:
-        await interaction.response.send_message("📭 No subreddits linked yet.", ephemeral=True)
+        await interaction.response.send_message("📭 No subreddits linked.", ephemeral=True)
 
-# Auto post loop
+# Auto post task
 @tasks.loop(minutes=5)
 async def auto_post():
     grouped = {}
@@ -220,15 +216,22 @@ async def auto_post():
                     print(f"Send error: {e}")
                     break
 
-# Ready
+# Ready and sync
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user}")
+    dev_guild = discord.Object(id=1369650511208513636)
     try:
-        await tree.sync()
-        print("✅ Slash commands synced.")
+        synced = await tree.sync()
+        print(f"🌍 Global commands: {len(synced)}")
     except Exception as e:
-        print(f"Sync error: {e}")
-    auto_post.start()
+        print(f"❌ Global sync error: {e}")
+    try:
+        dev_synced = await tree.sync(guild=dev_guild)
+        print(f"🛠️ Synced {len(dev_synced)} to dev guild.")
+    except Exception as e:
+        print(f"❌ Dev guild sync error: {e}")
+    if not auto_post.is_running():
+        auto_post.start()
 
 bot.run(os.getenv("DISCORD_TOKEN"))
