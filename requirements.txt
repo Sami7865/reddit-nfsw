@@ -1,5 +1,5 @@
 discord.py>=2.3.2
-pymongo[srv]>=4.7.2
-Flask>=3.0.3
-praw>=7.7.1
-dnspython>=2.6.1
+Flask>=3.0.0
+pymongo>=4.6.0
+asyncpraw>=7.7.0
+aiohttp>=3.9.0
