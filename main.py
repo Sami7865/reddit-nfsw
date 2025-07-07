@@ -13,6 +13,7 @@ import praw
 
 # --- Audioop Patch for Python 3.13+ ---
 if sys.version_info >= (3, 13):
+    import types
     sys.modules['audioop'] = types.SimpleNamespace()
 
 # --- Discord Bot Setup ---
@@ -50,11 +51,18 @@ def fetch_post(subreddit_name):
     for post in posts:
         if not post.over_18 or posts_col.find_one({"post_id": post.id}):
             continue
+
         media_url = ""
-        if post.url.endswith(('.jpg', '.png', '.gif', '.mp4', '.webm')):
+
+        if post.is_video and post.media and "reddit_video" in post.media:
+            media_url = post.media["reddit_video"]["fallback_url"]
+
+        elif post.url.endswith(('.jpg', '.png', '.gif', '.mp4', '.webm')):
             media_url = post.url
-        elif post.is_video and post.media and 'reddit_video' in post.media:
-            media_url = post.media['reddit_video']['fallback_url']
+
+        elif "i.redd.it" in post.url or "i.imgur.com" in post.url:
+            media_url = post.url
+
         if media_url:
             posts_col.insert_one({"post_id": post.id})
             return {
@@ -64,6 +72,7 @@ def fetch_post(subreddit_name):
                 "score": post.score,
                 "subreddit": subreddit_name
             }
+
     return None
 
 # --- Slash Command: Add Subreddit ---
@@ -169,7 +178,7 @@ async def send(interaction: discord.Interaction):
     else:
         await interaction.followup.send("❌ No content found.")
 
-# --- Slash Command: Force Send Posts From All Mappings (Admin Only) ---
+# --- Slash Command: Force Send (Admin Only) ---
 @tree.command(name="forcesend", description="Force post from all subreddits to their channels (admin only)")
 @app_commands.describe(count="Number of posts per mapping (1–5)")
 async def forcesend(interaction: discord.Interaction, count: int = 1):
