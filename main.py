@@ -1,44 +1,48 @@
 import os
 import random
+import types
+import threading
 import discord
-discord.opus._load_default = lambda: None  # Disable opus loader to prevent Render audioop crash
-
 from discord.ext import tasks
 from discord import app_commands
 from pymongo import MongoClient
 from flask import Flask
 import praw
-import threading
 
+# 🔧 Patch: Prevent audioop crash in Python 3.13 (Render safe)
+import discord.player
+discord.player.audioop = types.SimpleNamespace()
+discord.FFmpegPCMAudio = lambda *a, **k: None
+discord.PCMVolumeTransformer = lambda *a, **k: None
 
-# Discord bot
+# Discord bot setup
 intents = discord.Intents.default()
 intents.message_content = True
 bot = discord.Client(intents=intents)
 tree = app_commands.CommandTree(bot)
 
-# Flask keep-alive server
+# Flask keep-alive
 app = Flask(__name__)
 @app.route('/')
 def home():
     return "Bot is alive!"
 threading.Thread(target=lambda: app.run(host="0.0.0.0", port=8080)).start()
 
-# Reddit API setup
+# Reddit API via PRAW
 reddit = praw.Reddit(
     client_id=os.getenv("CLIENT_ID"),
     client_secret=os.getenv("CLIENT_SECRET"),
     user_agent=os.getenv("USER_AGENT")
 )
 
-# MongoDB connection
+# MongoDB setup
 mongo = MongoClient(os.getenv("MONGO_URI"))
 db = mongo["nsfw_bot"]
 subs_col = db["subreddit_channels"]
 posts_col = db["sent_posts"]
 intervals_col = db["guild_intervals"]
 
-# Fetch Reddit post
+# 🔁 Fetch Reddit NSFW media post
 def fetch_post(subreddit_name):
     subreddit = reddit.subreddit(subreddit_name)
     posts = list(subreddit.hot(limit=50))
@@ -92,11 +96,11 @@ async def removesub(interaction: discord.Interaction, subreddit: str):
         await interaction.response.send_message("❌ Subreddit not linked.", ephemeral=True)
 
 # Slash: Set post limit
-@tree.command(name="setlimit", description="Set posts per cycle for a subreddit")
+@tree.command(name="setlimit", description="Set post count per cycle for this channel/subreddit")
 @app_commands.describe(subreddit="Subreddit name", count="Posts per cycle (1–10)")
 async def setlimit(interaction: discord.Interaction, subreddit: str, count: int):
-    if count < 1 or count > 10:
-        await interaction.response.send_message("⚠️ Limit must be 1–10.", ephemeral=True)
+    if not (1 <= count <= 10):
+        await interaction.response.send_message("⚠️ Limit must be between 1–10.", ephemeral=True)
         return
     query = {
         "subreddit": subreddit,
@@ -110,19 +114,19 @@ async def setlimit(interaction: discord.Interaction, subreddit: str, count: int)
     old = mapping.get("limit", 1)
     subs_col.update_one(query, {"$set": {"limit": count}})
     await interaction.response.send_message(
-        f"✅ r/{subreddit} in <#{interaction.channel_id}> changed: {old} → {count}.",
+        f"✅ r/{subreddit} in <#{interaction.channel_id}>: {old} → {count}.",
         ephemeral=True
     )
 
-# Slash: Set interval (per server)
-@tree.command(name="setinterval", description="Set auto-post interval (admin only)")
+# Slash: Set posting interval (per server)
+@tree.command(name="setinterval", description="Set auto-post interval (admins only)")
 @app_commands.describe(minutes="Minutes between posts (1–1440)")
 async def setinterval(interaction: discord.Interaction, minutes: int):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Admins only.", ephemeral=True)
         return
-    if minutes < 1 or minutes > 1440:
-        await interaction.response.send_message("⚠️ 1–1440 min only.", ephemeral=True)
+    if not (1 <= minutes <= 1440):
+        await interaction.response.send_message("⚠️ Must be 1–1440 minutes.", ephemeral=True)
         return
     intervals_col.update_one(
         {"guild_id": interaction.guild_id},
@@ -131,8 +135,8 @@ async def setinterval(interaction: discord.Interaction, minutes: int):
     )
     await interaction.response.send_message(f"✅ Interval set to {minutes} min.", ephemeral=True)
 
-# Slash: Send manually
-@tree.command(name="send", description="Manually send post from a subreddit")
+# Slash: Manual post
+@tree.command(name="send", description="Manually send a post from a subreddit")
 @app_commands.describe(subreddit="Subreddit name")
 async def send(interaction: discord.Interaction, subreddit: str):
     await interaction.response.defer(thinking=True)
@@ -148,8 +152,8 @@ async def send(interaction: discord.Interaction, subreddit: str):
     else:
         await interaction.followup.send("❌ No content found.")
 
-# Slash: Force post
-@tree.command(name="forcepost", description="Force send from a linked subreddit")
+# Slash: Force post from linked sub
+@tree.command(name="forcepost", description="Force post from a linked subreddit")
 @app_commands.describe(subreddit="Subreddit name")
 async def forcepost(interaction: discord.Interaction, subreddit: str):
     entry = subs_col.find_one({"subreddit": subreddit, "guild_id": interaction.guild_id})
@@ -170,8 +174,8 @@ async def forcepost(interaction: discord.Interaction, subreddit: str):
     else:
         await interaction.response.send_message("❌ No content found.", ephemeral=True)
 
-# Slash: List linked subreddits
-@tree.command(name="listsubs", description="List all linked subreddits")
+# Slash: List subreddits linked to server
+@tree.command(name="listsubs", description="Show all linked subreddits for this server")
 async def listsubs(interaction: discord.Interaction):
     mappings = subs_col.find({"guild_id": interaction.guild_id})
     embed = discord.Embed(title="📄 Linked Subreddits", color=discord.Color.blurple())
@@ -187,13 +191,14 @@ async def listsubs(interaction: discord.Interaction):
     else:
         await interaction.response.send_message("📭 No subreddits linked.", ephemeral=True)
 
-# Auto post task
+# 🔁 Auto post loop
 @tasks.loop(minutes=5)
 async def auto_post():
     grouped = {}
     for entry in subs_col.find():
         key = (entry["guild_id"], entry["channel_id"])
         grouped.setdefault(key, []).append(entry)
+
     for (guild_id, channel_id), mappings in grouped.items():
         interval_doc = intervals_col.find_one({"guild_id": guild_id})
         interval = interval_doc["interval"] if interval_doc else 10
@@ -219,7 +224,7 @@ async def auto_post():
                     print(f"Send error: {e}")
                     break
 
-# Ready and sync
+# 🔁 On ready
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user}")
@@ -233,7 +238,7 @@ async def on_ready():
         dev_synced = await tree.sync(guild=dev_guild)
         print(f"🛠️ Synced {len(dev_synced)} to dev guild.")
     except Exception as e:
-        print(f"❌ Dev guild sync error: {e}")
+        print(f"❌ Dev sync error: {e}")
     if not auto_post.is_running():
         auto_post.start()
 
