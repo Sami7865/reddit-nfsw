@@ -1,5 +1,6 @@
-discord.py
-praw
+discord.py==2.3.2
 pymongo
 Flask
+praw
 python-dotenv
+
