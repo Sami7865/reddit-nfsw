@@ -1,6 +1,5 @@
 discord.py==2.3.2
-pymongo
-Flask
-praw
-python-dotenv
+praw==7.7.1
+pymongo==4.7.1
+Flask==3.0.3
 
