@@ -1,12 +1,15 @@
 import os
 import random
 import discord
+discord.opus._load_default = lambda: None  # Disable opus loader to prevent Render audioop crash
+
 from discord.ext import tasks
 from discord import app_commands
 from pymongo import MongoClient
 from flask import Flask
 import praw
 import threading
+
 
 # Discord bot
 intents = discord.Intents.default()
