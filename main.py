@@ -1,265 +1,233 @@
-import os
-import sys
-import random
 import discord
-import threading
-import types
-
-from discord.ext import tasks, commands
+from discord.ext import commands, tasks
 from discord import app_commands
-from pymongo import MongoClient
+import asyncio
+import os
+import logging
+import random
+import aiohttp
+import asyncpraw
 from flask import Flask
-import praw
+from threading import Thread
+from pymongo import MongoClient
+from datetime import datetime
+import warnings
 
-# --- Audioop Patch for Python 3.13+ ---
-if sys.version_info >= (3, 13):
+# ===================== AUDIOOP PATCH (for Python 3.13) =====================
+try:
+    import audioop
+except ImportError:
+    import sys
     import types
-    sys.modules['audioop'] = types.SimpleNamespace()
+    audioop = types.ModuleType("audioop")
+    sys.modules["audioop"] = audioop
+    audioop.error = Exception
+# ==========================================================================
 
-# --- Discord Bot Setup ---
+# =========================== CONFIGS ===========================
+TOKEN = os.getenv("DISCORD_TOKEN")
+REDDIT_CLIENT_ID = os.getenv("REDDIT_CLIENT_ID")
+REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET")
+REDDIT_USER_AGENT = os.getenv("REDDIT_USER_AGENT", "discord:nsfw-bot:v1.0 (by u/Efficient-Life-554)")
+MONGO_URI = os.getenv("MONGO_URI")
+
+LOG_CHANNEL_ID = 1391882689069580360
+BOT_OWNER_ID = 887243211645546517
+
 intents = discord.Intents.default()
-intents.message_content = True
+intents.guilds = True
+intents.messages = True
+
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
-# --- Flask Keep Alive (Render) ---
-app = Flask(__name__)
-@app.route('/')
-def home():
-    return "Bot is alive!"
-threading.Thread(target=lambda: app.run(host='0.0.0.0', port=8080)).start()
-
-# --- MongoDB Setup ---
-mongo = MongoClient(os.getenv("MONGO_URI"))
-db = mongo["nsfw_bot"]
-subs_col = db["subreddit_channels"]
-posts_col = db["sent_posts"]
-intervals_col = db["guild_intervals"]
-
-# --- Reddit API Setup ---
-reddit = praw.Reddit(
-    client_id=os.getenv("CLIENT_ID"),
-    client_secret=os.getenv("CLIENT_SECRET"),
-    user_agent=os.getenv("USER_AGENT")
+reddit = asyncpraw.Reddit(
+    client_id=REDDIT_CLIENT_ID,
+    client_secret=REDDIT_CLIENT_SECRET,
+    user_agent=REDDIT_USER_AGENT
 )
 
-# --- Fetch a Valid NSFW Reddit Post ---
-def fetch_post(subreddit_name):
-    subreddit = reddit.subreddit(subreddit_name)
-    posts = list(subreddit.hot(limit=50))
-    random.shuffle(posts)
-    for post in posts:
-        if not post.over_18 or posts_col.find_one({"post_id": post.id}):
-            continue
+mongo_client = MongoClient(MONGO_URI)
+db = mongo_client["reddit_bot"]
+mapping_col = db["subreddit_channel_mapping"]
+config_col = db["global_config"]
 
-        media_url = ""
+# ========== INITIAL CONFIG ==========
+GLOBAL_POST_INTERVAL = config_col.find_one({"_id": "global"}) or {"_id": "global", "interval": 30}
+config_col.update_one({"_id": "global"}, {"$set": GLOBAL_POST_INTERVAL}, upsert=True)
 
-        if post.is_video and post.media and "reddit_video" in post.media:
-            media_url = post.media["reddit_video"]["fallback_url"]
+# ======================= LOGGING SETUP ========================
+logging.basicConfig(level=logging.INFO)
 
-        elif post.url.endswith(('.jpg', '.png', '.gif', '.mp4', '.webm')):
-            media_url = post.url
+# =============== FLASK SERVER FOR UPTIME ======================
+app = Flask("")
 
-        elif "i.redd.it" in post.url or "i.imgur.com" in post.url:
-            media_url = post.url
+@app.route("/")
+def home():
+    return "Bot is alive!"
 
-        if media_url:
-            posts_col.insert_one({"post_id": post.id})
-            return {
-                "title": post.title,
-                "url": media_url,
-                "permalink": f"https://reddit.com{post.permalink}",
-                "score": post.score,
-                "subreddit": subreddit_name
-            }
+def run():
+    app.run(host="0.0.0.0", port=8080)
 
-    return None
+Thread(target=run).start()
 
-# --- Slash Command: Add Subreddit ---
-@tree.command(name="addsub", description="Link a subreddit to this channel")
+# ======================== HELPERS ==============================
+
+async def fetch_post(subreddit_name):
+    try:
+        subreddit = await reddit.subreddit(subreddit_name, fetch=True)
+        posts = [post async for post in subreddit.hot(limit=50) if not post.stickied and post.over_18]
+        return random.choice(posts) if posts else None
+    except Exception:
+        return None
+
+async def send_to_channel(channel_id, post):
+    channel = bot.get_channel(channel_id)
+    if not channel:
+        mapping_col.delete_many({"channel_id": channel_id})
+        return
+    embed = discord.Embed(title=post.title, url=post.url, color=discord.Color.red())
+    embed.set_image(url=post.url)
+    await channel.send(embed=embed)
+
+async def log_error(message: str):
+    channel = bot.get_channel(LOG_CHANNEL_ID)
+    if channel:
+        await channel.send(f"⚠️ {message}")
+
+async def dm_owner(error: str):
+    owner = bot.get_user(BOT_OWNER_ID)
+    if owner:
+        try:
+            await owner.send(f"🚨 Bot Error:\n```{error}```")
+        except:
+            pass
+
+def is_admin(interaction: discord.Interaction):
+    return interaction.user.guild_permissions.administrator
+
+# ======================= COMMANDS ==============================
+
+@tree.command(name="addsub", description="Link a subreddit to this channel.")
 @app_commands.describe(subreddit="Subreddit name")
 async def addsub(interaction: discord.Interaction, subreddit: str):
-    query = {"subreddit": subreddit, "channel_id": interaction.channel_id, "guild_id": interaction.guild_id}
-    if subs_col.find_one(query):
-        await interaction.response.send_message("⚠️ Already linked.", ephemeral=True)
-    else:
-        subs_col.insert_one(query)
-        await interaction.response.send_message(f"✅ Linked r/{subreddit} to this channel.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    mapping_col.update_one(
+        {"channel_id": interaction.channel_id},
+        {"$set": {"subreddit": subreddit.lower(), "limit": 1, "interval": 60}},
+        upsert=True
+    )
+    await interaction.followup.send(f"✅ Linked this channel to r/{subreddit}")
 
-# --- Slash Command: Remove Subreddit ---
-@tree.command(name="removesub", description="Unlink subreddit from this channel")
-@app_commands.describe(subreddit="Subreddit name")
-async def removesub(interaction: discord.Interaction, subreddit: str):
-    result = subs_col.delete_one({
-        "subreddit": subreddit,
-        "channel_id": interaction.channel_id,
-        "guild_id": interaction.guild_id
-    })
-    if result.deleted_count:
-        await interaction.response.send_message(f"✅ Unlinked r/{subreddit}.", ephemeral=True)
-    else:
-        await interaction.response.send_message("❌ Subreddit not linked.", ephemeral=True)
+@tree.command(name="removesub", description="Unlink subreddit from this channel.")
+async def removesub(interaction: discord.Interaction):
+    mapping_col.delete_one({"channel_id": interaction.channel_id})
+    await interaction.response.send_message("❌ Subreddit unlinked from this channel.", ephemeral=True)
 
-# --- Slash Command: Set Post Limit (Admin Only) ---
-@tree.command(name="setlimit", description="Set number of posts to send per cycle")
-@app_commands.describe(subreddit="Subreddit name", count="Posts per cycle (1–10)")
-async def setlimit(interaction: discord.Interaction, subreddit: str, count: int):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ Admins only.", ephemeral=True)
-        return
-    if count < 1 or count > 10:
-        await interaction.response.send_message("⚠️ Limit must be 1–10.", ephemeral=True)
-        return
-    query = {
-        "subreddit": subreddit,
-        "channel_id": interaction.channel_id,
-        "guild_id": interaction.guild_id
-    }
-    subs_col.update_one(query, {"$set": {"limit": count}})
-    await interaction.response.send_message(f"✅ Set r/{subreddit} limit to {count} in this channel.", ephemeral=True)
-
-# --- Slash Command: Set Interval (Admin Only) ---
-@tree.command(name="setinterval", description="Set auto-post interval in minutes (admin only)")
-@app_commands.describe(minutes="Interval in minutes (1–1440)")
-async def setinterval(interaction: discord.Interaction, minutes: int):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ Admins only.", ephemeral=True)
-        return
-    if minutes < 1 or minutes > 1440:
-        await interaction.response.send_message("⚠️ Range: 1–1440", ephemeral=True)
-        return
-    intervals_col.update_one({"guild_id": interaction.guild_id}, {"$set": {"interval": minutes}}, upsert=True)
-    await interaction.response.send_message(f"✅ Interval set to {minutes} min.", ephemeral=True)
-
-# --- Slash Command: List Linked Subreddits ---
-@tree.command(name="listsubs", description="List all linked subreddits in this server")
+@tree.command(name="listsubs", description="List all channel-subreddit links.")
 async def listsubs(interaction: discord.Interaction):
-    mappings = subs_col.find({"guild_id": interaction.guild_id})
-    embed = discord.Embed(title="📄 Linked Subreddits", color=discord.Color.blurple())
-    found = False
-    for entry in mappings:
-        found = True
-        channel = bot.get_channel(entry["channel_id"])
-        mention = f"<#{entry['channel_id']}>" if channel else "`unknown`"
-        limit = entry.get("limit", 1)
-        embed.add_field(name=f"r/{entry['subreddit']}", value=f"{mention} • Limit: {limit}", inline=False)
-    if found:
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-    else:
-        await interaction.response.send_message("📭 No subreddits linked.", ephemeral=True)
+    data = mapping_col.find()
+    msg = "\n".join([f"<#{d['channel_id']}> ➜ r/{d['subreddit']}" for d in data])
+    await interaction.response.send_message(f"📜 Linked Channels:\n{msg or 'None'}", ephemeral=True)
 
-# --- Slash Command: Send (With Cooldown & NSFW Check) ---
-@tree.command(name="send", description="Send a post from the subreddit linked to this channel")
-@commands.cooldown(rate=1, per=10, type=commands.BucketType.channel)
+@tree.command(name="setlimit", description="Set max posts per send.")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.describe(limit="Number of posts per send (1-10)")
+async def setlimit(interaction: discord.Interaction, limit: int):
+    if not (1 <= limit <= 10):
+        await interaction.response.send_message("⚠️ Limit must be between 1 and 10.", ephemeral=True)
+        return
+    mapping_col.update_one({"channel_id": interaction.channel_id}, {"$set": {"limit": limit}})
+    await interaction.response.send_message(f"✅ Set limit to {limit}", ephemeral=True)
+
+@tree.command(name="setinterval", description="Set interval between posts in minutes.")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.describe(minutes="Interval in minutes (minimum 1)")
+async def setinterval(interaction: discord.Interaction, minutes: int):
+    if minutes < 1:
+        await interaction.response.send_message("⚠️ Interval must be at least 1 minute.", ephemeral=True)
+        return
+    mapping_col.update_one({"channel_id": interaction.channel_id}, {"$set": {"interval": minutes}})
+    await interaction.response.send_message(f"✅ Set interval to {minutes} min", ephemeral=True)
+
+@tree.command(name="setglobalinterval", description="Set global post interval (for all channels).")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.describe(minutes="Global interval (minutes)")
+async def setglobalinterval(interaction: discord.Interaction, minutes: int):
+    if minutes < 1:
+        await interaction.response.send_message("⚠️ Interval must be at least 1 min.", ephemeral=True)
+        return
+    config_col.update_one({"_id": "global"}, {"$set": {"interval": minutes}}, upsert=True)
+    await interaction.response.send_message(f"✅ Global post interval set to {minutes} min", ephemeral=True)
+    global GLOBAL_POST_INTERVAL
+    GLOBAL_POST_INTERVAL["interval"] = minutes
+    global_poster.restart()
+
+@tree.command(name="send", description="Send a post from this channel's subreddit.")
+@app_commands.checks.cooldown(1, 10.0)
 async def send(interaction: discord.Interaction):
-    if not interaction.channel.is_nsfw():
-        await interaction.response.send_message("⚠️ NSFW channels only.", ephemeral=True)
-        return
-
-    # Bypass cooldown for Admin/Mods
-    if interaction.user.guild_permissions.administrator or interaction.user.guild_permissions.manage_messages:
-        send.reset_cooldown(interaction)
-
-    mapping = subs_col.find_one({
-        "channel_id": interaction.channel_id,
-        "guild_id": interaction.guild_id
-    })
+    await interaction.response.defer()
+    mapping = mapping_col.find_one({"channel_id": interaction.channel_id})
     if not mapping:
-        await interaction.response.send_message("❌ No subreddit linked to this channel.", ephemeral=True)
+        await interaction.followup.send("⚠️ No subreddit linked to this channel.")
         return
+    post = await fetch_post(mapping["subreddit"])
+    if not post:
+        await interaction.followup.send("⚠️ Couldn't fetch post.")
+        return
+    embed = discord.Embed(title=post.title, url=post.url, color=discord.Color.red())
+    embed.set_image(url=post.url)
+    await interaction.followup.send(embed=embed)
 
-    await interaction.response.defer(thinking=True)
-    post = fetch_post(mapping["subreddit"])
-    if post:
-        embed = discord.Embed(title=post["title"], url=post["permalink"], color=discord.Color.red())
-        embed.set_image(url=post["url"])
-        embed.set_footer(text=f"👍 {post['score']} • r/{post['subreddit']}")
-        await interaction.followup.send(embed=embed)
-    else:
-        await interaction.followup.send("❌ No content found.")
-
-# --- Slash Command: Force Send (Admin Only) ---
-@tree.command(name="forcesend", description="Force post from all subreddits to their channels (admin only)")
-@app_commands.describe(count="Number of posts per mapping (1–5)")
+@tree.command(name="forcesend", description="Send posts from all linked subreddits.")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.describe(count="Max posts per channel (default 1)")
 async def forcesend(interaction: discord.Interaction, count: int = 1):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ Admin only.", ephemeral=True)
-        return
-    if count < 1 or count > 5:
-        await interaction.response.send_message("⚠️ Count must be between 1–5.", ephemeral=True)
-        return
-    await interaction.response.defer(thinking=True)
+    await interaction.response.defer(ephemeral=True)
+    data = mapping_col.find()
+    for mapping in data:
+        for _ in range(min(count, mapping.get("limit", 1))):
+            post = await fetch_post(mapping["subreddit"])
+            if post:
+                await send_to_channel(mapping["channel_id"], post)
+    await interaction.followup.send("✅ Forced post complete.")
 
-    sent_any = False
-    for mapping in subs_col.find({"guild_id": interaction.guild_id}):
-        channel = bot.get_channel(mapping["channel_id"])
-        if not channel or not channel.is_nsfw():
-            continue
-        sent = 0
-        while sent < count:
-            post = fetch_post(mapping["subreddit"])
-            if not post:
-                break
-            embed = discord.Embed(title=post["title"], url=post["permalink"], color=discord.Color.red())
-            embed.set_image(url=post["url"])
-            embed.set_footer(text=f"👍 {post['score']} • r/{post['subreddit']}")
-            try:
-                await channel.send(embed=embed)
-                sent += 1
-                sent_any = True
-            except Exception as e:
-                print(f"Send error in /forcesend: {e}")
-                break
+# ================ GLOBAL POSTING TASK =================
 
-    if sent_any:
-        await interaction.followup.send("✅ Posts sent.")
-    else:
-        await interaction.followup.send("❌ No posts could be sent.")
+@tasks.loop(minutes=GLOBAL_POST_INTERVAL["interval"])
+async def global_poster():
+    data = mapping_col.find()
+    for mapping in data:
+        interval = mapping.get("interval", GLOBAL_POST_INTERVAL["interval"])
+        last_post_time = mapping.get("last_post_time")
+        now = datetime.utcnow()
+        if not last_post_time or (now - last_post_time).total_seconds() >= interval * 60:
+            for _ in range(mapping.get("limit", 1)):
+                post = await fetch_post(mapping["subreddit"])
+                if post:
+                    await send_to_channel(mapping["channel_id"], post)
+            mapping_col.update_one({"channel_id": mapping["channel_id"]}, {"$set": {"last_post_time": now}})
 
-# --- Auto Posting Task (5 min loop) ---
-@tasks.loop(minutes=5)
-async def auto_post():
-    grouped = {}
-    for entry in subs_col.find():
-        key = (entry["guild_id"], entry["channel_id"])
-        grouped.setdefault(key, []).append(entry)
-    for (guild_id, channel_id), mappings in grouped.items():
-        interval_doc = intervals_col.find_one({"guild_id": guild_id})
-        interval = interval_doc["interval"] if interval_doc else 10
-        if auto_post.current_loop % (interval // 5) != 0:
-            continue
-        channel = bot.get_channel(channel_id)
-        if not channel or not channel.is_nsfw():
-            continue
-        for mapping in mappings:
-            post_limit = mapping.get("limit", 1)
-            sent = 0
-            while sent < post_limit:
-                post = fetch_post(mapping["subreddit"])
-                if not post:
-                    break
-                embed = discord.Embed(title=post["title"], url=post["permalink"], color=discord.Color.red())
-                embed.set_image(url=post["url"])
-                embed.set_footer(text=f"👍 {post['score']} • r/{post['subreddit']}")
-                try:
-                    await channel.send(embed=embed)
-                    sent += 1
-                except Exception as e:
-                    print(f"Auto send error: {e}")
-                    break
+@global_poster.before_loop
+async def before_global_poster():
+    await bot.wait_until_ready()
 
-# --- On Ready Event ---
+# =================== EVENTS ===================
+
 @bot.event
 async def on_ready():
+    await tree.sync()
     print(f"✅ Logged in as {bot.user}")
-    dev_guild = discord.Object(id=1369650511208513636)
-    try:
-        await tree.sync()
-        await tree.sync(guild=dev_guild)
-        print("✅ Slash commands synced.")
-    except Exception as e:
-        print(f"❌ Sync error: {e}")
-    if not auto_post.is_running():
-        auto_post.start()
+    global_poster.start()
 
-bot.run(os.getenv("DISCORD_TOKEN"))
+@bot.event
+async def on_guild_channel_delete(channel):
+    mapping_col.delete_one({"channel_id": channel.id})
+
+@bot.event
+async def on_command_error(ctx, error):
+    await log_error(str(error))
+    await dm_owner(str(error))
+
+# ================ RUN BOT ===================
+bot.run(TOKEN)
