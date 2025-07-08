@@ -9,7 +9,6 @@ from discord.ext import tasks
 from discord import app_commands
 from flask import Flask
 from pymongo import MongoClient
-from dotenv import load_dotenv
 import asyncpraw
 
 load_dotenv()
