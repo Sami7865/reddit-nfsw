@@ -3,12 +3,19 @@ import discord
 import asyncio
 import random
 import logging
-import audioop
+import types
+import aiohttp
 from discord.ext import tasks
 from discord import app_commands
 from flask import Flask
 from pymongo import MongoClient
 import asyncpraw
+
+# --- Audioop Patch for Python 3.13 ---
+import sys
+if sys.version_info >= (3, 13):
+    import types
+    sys.modules['audioop'] = types.SimpleNamespace()
 
 # ENV Variables from Render
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -32,17 +39,15 @@ db = mongo_client["reddit"]
 subs_col = db["subs"]
 config_col = db["config"]
 
-# Global post interval
 GLOBAL_POST_INTERVAL = 30
 
 # Flask Keep-Alive
 app = Flask("")
-
 @app.route("/")
 def home():
     return "Bot is running!"
 
-# Error DM to Owner
+# DM error to owner
 async def send_owner_dm(message):
     try:
         owner = await client.fetch_user(OWNER_ID)
@@ -54,7 +59,7 @@ def is_admin_or_mod(interaction: discord.Interaction):
     perms = interaction.user.guild_permissions
     return perms.administrator or perms.manage_messages
 
-# Reddit client must be created INSIDE the coroutine
+# Reddit instance (per request)
 async def get_reddit():
     return asyncpraw.Reddit(
         client_id=REDDIT_CLIENT_ID,
@@ -62,20 +67,42 @@ async def get_reddit():
         user_agent=REDDIT_USER_AGENT
     )
 
-# Fetch post
+# Fetch valid post (including v.redd.it)
 async def fetch_post(subreddit_name, limit):
     try:
         reddit = await get_reddit()
         subreddit = await reddit.subreddit(subreddit_name)
         await subreddit.load()
-        submissions = [s async for s in subreddit.hot(limit=limit)]
-        posts = [s for s in submissions if not s.stickied and hasattr(s, "url")]
-        return random.choice(posts) if posts else None
+        posts = [p async for p in subreddit.hot(limit=limit)]
+        random.shuffle(posts)
+        for post in posts:
+            if post.stickied or not post.over_18:
+                continue
+
+            media_url = None
+
+            # Handle known content
+            if post.url.endswith(('.jpg', '.png', '.jpeg', '.gif')):
+                media_url = post.url
+            elif "redgifs.com" in post.url or "gfycat.com" in post.url:
+                media_url = post.url
+            elif post.is_video and post.media and "reddit_video" in post.media:
+                media_url = post.media["reddit_video"]["fallback_url"]
+
+            if media_url:
+                return {
+                    "title": post.title,
+                    "url": media_url,
+                    "permalink": f"https://reddit.com{post.permalink}",
+                    "score": post.score,
+                    "subreddit": subreddit_name
+                }
+        return None
     except Exception as e:
         await send_owner_dm(f"Error fetching r/{subreddit_name}: {e}")
         return None
 
-# Send to channel
+# Send post to a channel
 async def send_subreddit_post(channel_id, subreddit, limit):
     channel = client.get_channel(channel_id)
     if not channel:
@@ -84,10 +111,17 @@ async def send_subreddit_post(channel_id, subreddit, limit):
     post = await fetch_post(subreddit, limit)
     if not post:
         return
-    embed = discord.Embed(title=post.title, url=f"https://reddit.com{post.permalink}", color=0xFF005F)
-    if post.url.endswith(("jpg", "jpeg", "png", "gif")):
-        embed.set_image(url=post.url)
-    embed.set_footer(text=f"From r/{subreddit}")
+    embed = discord.Embed(title=post["title"], url=post["permalink"], color=0xFF005F)
+    embed.set_footer(text=f"👍 {post['score']} • r/{subreddit}")
+    if post["url"].endswith(("jpg", "jpeg", "png", "gif", "webp")):
+        embed.set_image(url=post["url"])
+    elif "v.redd.it" in post["url"] or post["url"].endswith((".mp4", ".webm")):
+        embed.description = f"[🔗 Video link]({post['url']})"
+    elif "redgifs.com" in post["url"] or "gfycat.com" in post["url"]:
+        embed.description = f"[🔞 Click to view on Redgifs]({post['url']})"
+    else:
+        embed.description = f"[🔗 Link]({post['url']})"
+
     try:
         await channel.send(embed=embed)
         log_channel = client.get_channel(LOG_CHANNEL_ID)
@@ -96,7 +130,7 @@ async def send_subreddit_post(channel_id, subreddit, limit):
     except discord.HTTPException as e:
         await send_owner_dm(f"Failed to send embed to {channel.id} (r/{subreddit}): {e}")
 
-# Commands
+# Slash Commands
 @tree.command(name="send", description="Send a Reddit post from the linked subreddit")
 @app_commands.checks.cooldown(1, 10)
 async def send(interaction: discord.Interaction):
@@ -174,6 +208,7 @@ async def setglobalinterval(interaction: discord.Interaction, minutes: int):
     config_col.update_one({"_id": "global"}, {"$set": {"interval": minutes}}, upsert=True)
     await interaction.response.send_message(f"✅ Global interval set to {minutes} minutes.", ephemeral=True)
 
+# Error handler
 @client.event
 async def on_app_command_error(interaction, error):
     if isinstance(error, app_commands.errors.CommandOnCooldown):
@@ -183,13 +218,15 @@ async def on_app_command_error(interaction, error):
     else:
         await send_owner_dm(f"❌ Unhandled error: {error}")
 
+# Ready event
 @client.event
 async def on_ready():
-    print(f"Logged in as {client.user}")
+    print(f"✅ Logged in as {client.user}")
     await tree.sync()
     await tree.sync(guild=discord.Object(id=GUILD_ID))
     autopost.start()
 
+# Auto posting loop
 @tasks.loop(minutes=1)
 async def autopost():
     config = config_col.find_one({"_id": "global"})
@@ -199,6 +236,7 @@ async def autopost():
         if random.randint(1, interval) == 1:
             await send_subreddit_post(doc["channel_id"], doc["subreddit"], doc.get("limit", 50))
 
+# Start Flask + Discord bot
 if __name__ == "__main__":
     import threading
     threading.Thread(target=lambda: app.run(host="0.0.0.0", port=8080)).start()
