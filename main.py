@@ -11,7 +11,7 @@ from flask import Flask
 from pymongo import MongoClient
 import asyncpraw
 
-load_dotenv()
+# ✅ NO load_dotenv() needed here — Render handles env vars
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 MONGO_URI = os.getenv("MONGO_URI")
@@ -47,8 +47,8 @@ def home():
     return "Bot is running!"
 
 async def send_owner_dm(message):
-    owner = await client.fetch_user(OWNER_ID)
     try:
+        owner = await client.fetch_user(OWNER_ID)
         await owner.send(f"⚠️ Error:\n```{message}```")
     except:
         pass
