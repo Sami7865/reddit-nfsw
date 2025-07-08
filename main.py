@@ -2,7 +2,6 @@ import os
 import discord
 import asyncio
 import random
-import aiohttp
 import logging
 import audioop
 from discord.ext import tasks
@@ -11,7 +10,7 @@ from flask import Flask
 from pymongo import MongoClient
 import asyncpraw
 
-# Load secrets from Render environment variables
+# ENV Variables from Render
 TOKEN = os.getenv("DISCORD_TOKEN")
 MONGO_URI = os.getenv("MONGO_URI")
 REDDIT_CLIENT_ID = os.getenv("REDDIT_CLIENT_ID")
@@ -22,34 +21,28 @@ OWNER_ID = 887243211645546517
 LOG_CHANNEL_ID = 1391882689069580360
 GUILD_ID = 1369650511208513636
 
-# Discord client
+# Discord Setup
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
-# Reddit client (async)
-reddit = asyncpraw.Reddit(
-    client_id=REDDIT_CLIENT_ID,
-    client_secret=REDDIT_CLIENT_SECRET,
-    user_agent=REDDIT_USER_AGENT
-)
-
-# MongoDB setup
-mongo = MongoClient(MONGO_URI)
-db = mongo["reddit"]
+# MongoDB Setup
+mongo_client = MongoClient(MONGO_URI)
+db = mongo_client["reddit"]
 subs_col = db["subs"]
 config_col = db["config"]
 
-# Flask keep-alive
+# Global post interval
+GLOBAL_POST_INTERVAL = 30
+
+# Flask Keep-Alive
 app = Flask("")
+
 @app.route("/")
 def home():
     return "Bot is running!"
 
-# Default interval
-GLOBAL_POST_INTERVAL = 30
-
-# DM errors to owner
+# Error DM to Owner
 async def send_owner_dm(message):
     try:
         owner = await client.fetch_user(OWNER_ID)
@@ -57,16 +50,24 @@ async def send_owner_dm(message):
     except:
         pass
 
-# Helper: is admin/mod
 def is_admin_or_mod(interaction: discord.Interaction):
     perms = interaction.user.guild_permissions
-    return perms.administrator or perms.manage_guild or perms.manage_channels
+    return perms.administrator or perms.manage_messages
 
-# Reddit post fetcher
+# Reddit client must be created INSIDE the coroutine
+async def get_reddit():
+    return asyncpraw.Reddit(
+        client_id=REDDIT_CLIENT_ID,
+        client_secret=REDDIT_CLIENT_SECRET,
+        user_agent=REDDIT_USER_AGENT
+    )
+
+# Fetch post
 async def fetch_post(subreddit_name, limit):
     try:
+        reddit = await get_reddit()
         subreddit = await reddit.subreddit(subreddit_name)
-        await asyncio.create_task(subreddit.load())  # Fixes timeout in Python 3.13+
+        await subreddit.load()
         submissions = [s async for s in subreddit.hot(limit=limit)]
         posts = [s for s in submissions if not s.stickied and hasattr(s, "url")]
         return random.choice(posts) if posts else None
@@ -74,7 +75,7 @@ async def fetch_post(subreddit_name, limit):
         await send_owner_dm(f"Error fetching r/{subreddit_name}: {e}")
         return None
 
-# Send post to a channel
+# Send to channel
 async def send_subreddit_post(channel_id, subreddit, limit):
     channel = client.get_channel(channel_id)
     if not channel:
@@ -95,8 +96,7 @@ async def send_subreddit_post(channel_id, subreddit, limit):
     except discord.HTTPException as e:
         await send_owner_dm(f"Failed to send embed to {channel.id} (r/{subreddit}): {e}")
 
-# Slash commands
-
+# Commands
 @tree.command(name="send", description="Send a Reddit post from the linked subreddit")
 @app_commands.checks.cooldown(1, 10)
 async def send(interaction: discord.Interaction):
@@ -123,10 +123,11 @@ async def forcesend(interaction: discord.Interaction, count: int = 1):
 @app_commands.describe(subreddit="The subreddit to link")
 async def addsub(interaction: discord.Interaction, subreddit: str):
     try:
+        reddit = await get_reddit()
         sub = await reddit.subreddit(subreddit)
-        await asyncio.create_task(sub.load())  # Fix for timeout issue
+        await sub.load()
         if not sub.over18:
-            await interaction.response.send_message("⚠️ This subreddit is not marked NSFW.", ephemeral=True)
+            await interaction.response.send_message("⚠️ Subreddit is not NSFW.", ephemeral=True)
             return
         subs_col.update_one(
             {"channel_id": interaction.channel.id},
@@ -140,7 +141,7 @@ async def addsub(interaction: discord.Interaction, subreddit: str):
 @tree.command(name="removesub", description="Unlink subreddit from this channel")
 async def removesub(interaction: discord.Interaction):
     subs_col.delete_one({"channel_id": interaction.channel.id})
-    await interaction.response.send_message("✅ Unlinked subreddit from this channel.", ephemeral=True)
+    await interaction.response.send_message("✅ Subreddit unlinked.", ephemeral=True)
 
 @tree.command(name="listsubs", description="List all subreddit links")
 @app_commands.checks.has_permissions(administrator=True)
@@ -155,35 +156,33 @@ async def listsubs(interaction: discord.Interaction):
 @tree.command(name="setlimit", description="Set how many posts to pull from subreddit")
 @app_commands.checks.has_permissions(administrator=True)
 async def setlimit(interaction: discord.Interaction, limit: int):
-    if limit < 1 or limit > 100:
+    if not (1 <= limit <= 100):
         await interaction.response.send_message("⚠️ Limit must be between 1 and 100.", ephemeral=True)
         return
     subs_col.update_one({"channel_id": interaction.channel.id}, {"$set": {"limit": limit}})
-    await interaction.response.send_message(f"✅ Limit set to {limit} for this channel.", ephemeral=True)
+    await interaction.response.send_message(f"✅ Limit set to {limit}.", ephemeral=True)
 
 @tree.command(name="setinterval", description="Set posting interval for this channel")
 @app_commands.checks.has_permissions(administrator=True)
 async def setinterval(interaction: discord.Interaction, minutes: int):
     subs_col.update_one({"channel_id": interaction.channel.id}, {"$set": {"interval": minutes}})
-    await interaction.response.send_message(f"✅ Posting interval set to {minutes} minutes for this channel.", ephemeral=True)
+    await interaction.response.send_message(f"✅ Interval set to {minutes} minutes.", ephemeral=True)
 
-@tree.command(name="setglobalinterval", description="Set global post interval (all channels)")
+@tree.command(name="setglobalinterval", description="Set global interval")
 @app_commands.checks.has_permissions(administrator=True)
 async def setglobalinterval(interaction: discord.Interaction, minutes: int):
     config_col.update_one({"_id": "global"}, {"$set": {"interval": minutes}}, upsert=True)
     await interaction.response.send_message(f"✅ Global interval set to {minutes} minutes.", ephemeral=True)
 
-# Slash command errors
 @client.event
 async def on_app_command_error(interaction, error):
     if isinstance(error, app_commands.errors.CommandOnCooldown):
         await interaction.response.send_message(f"⏳ Cooldown: try again in {round(error.retry_after, 1)}s.", ephemeral=True)
     elif isinstance(error, app_commands.errors.CheckFailure):
-        await interaction.response.send_message("🚫 You don't have permission to use this command.", ephemeral=True)
+        await interaction.response.send_message("🚫 You don't have permission.", ephemeral=True)
     else:
-        await send_owner_dm(f"Unhandled error: {error}")
+        await send_owner_dm(f"❌ Unhandled error: {error}")
 
-# Ready
 @client.event
 async def on_ready():
     print(f"Logged in as {client.user}")
@@ -191,19 +190,15 @@ async def on_ready():
     await tree.sync(guild=discord.Object(id=GUILD_ID))
     autopost.start()
 
-# Auto posting
 @tasks.loop(minutes=1)
 async def autopost():
-    global GLOBAL_POST_INTERVAL
     config = config_col.find_one({"_id": "global"})
-    if config:
-        GLOBAL_POST_INTERVAL = config.get("interval", 30)
+    interval_val = config.get("interval", 30) if config else GLOBAL_POST_INTERVAL
     for doc in subs_col.find():
-        interval = doc.get("interval", GLOBAL_POST_INTERVAL)
+        interval = doc.get("interval", interval_val)
         if random.randint(1, interval) == 1:
             await send_subreddit_post(doc["channel_id"], doc["subreddit"], doc.get("limit", 50))
 
-# Uptime + bot runner
 if __name__ == "__main__":
     import threading
     threading.Thread(target=lambda: app.run(host="0.0.0.0", port=8080)).start()
