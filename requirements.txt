@@ -1,4 +1,4 @@
-git+https://github.com/Rapptz/discord.py@2.3.2#egg=discord.py&subdirectory=discord-py-no-voice
+git+https://github.com/Rapptz/discord.py.git@no-voice#egg=discord.py
 aiohttp==3.9.5
 yarl==1.9.4
 frozenlist==1.4.1
