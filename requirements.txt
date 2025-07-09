@@ -1,7 +1,7 @@
+git+https://github.com/Rapptz/discord.py@2.3.2#egg=discord.py&subdirectory=discord-py-no-voice
 aiohttp==3.9.5
 yarl==1.9.4
 frozenlist==1.4.1
-discord.py==2.3.2
 asyncpraw==7.7.1
 pymongo==4.7.2
 Flask==3.0.3
