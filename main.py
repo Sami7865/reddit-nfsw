@@ -56,8 +56,16 @@ if not MONGO_URI:
     missing_vars.append("MONGO_URI")
 if missing_vars:
     print(f"[FATAL] Missing required environment variables: {', '.join(missing_vars)}")
-    print("Please set these in your Render environment settings.")
+    print("Please set these in your Render environment settings at:")
+    print("https://dashboard.render.com > Your Service > Environment")
     import sys; sys.exit(1)
+
+# Print startup info
+print("\n=== Bot Configuration ===")
+print(f"Running on Render")
+print(f"Reddit Username: {REDDIT_USERNAME}")
+print(f"Reddit Client ID: {REDDIT_CLIENT_ID}")
+print(f"MongoDB URI configured: {'Yes' if MONGO_URI else 'No'}")
 
 BOT_OWNER_ID = 887243211645546517
 LOGGING_CHANNEL_ID = 1391882689069580360
@@ -74,52 +82,108 @@ mongo_client = MongoClient(MONGO_URI)
 db = mongo_client["reddit_bot"]
 config_col = db["configs"]
 
-# ─── Reddit Client ──────────────────────────────────────────────────────────────
+# ─── Reddit Client ──────────────────────────────────────────────────────────────────
+import aiohttp
+
+# Create custom session with longer timeout
+session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
+
+# Initialize Reddit client with Render-specific user agent
+USER_AGENT = f"render:discord.nsfw.bot:v1.0 (by /u/{REDDIT_USERNAME})"
+print(f"User Agent: {USER_AGENT}")
+
 reddit = asyncpraw.Reddit(
     client_id=REDDIT_CLIENT_ID,
     client_secret=REDDIT_CLIENT_SECRET,
     username=REDDIT_USERNAME,
     password=REDDIT_PASSWORD,
-    user_agent="Discord NSFW Bot by u/Efficient-Life-554",
-    check_for_async=False,
-    requestor_kwargs={"timeout": 30}
+    user_agent=USER_AGENT,
+    requestor_kwargs={"session": session}
 )
 
-# Set Reddit client options
-reddit.config.custom_multireddit_fetch = True
-reddit.read_only = False
+# Test Reddit authentication immediately
+async def test_reddit_auth():
+    try:
+        print("\n=== Testing Reddit Authentication ===")
+        # Try to get user info to verify auth
+        user = await reddit.user.me()
+        print(f"✓ Successfully authenticated as: {user.name}")
+        print(f"✓ Account created: {datetime.fromtimestamp(user.created_utc, UTC)}")
+        
+        # Test accessing a known public subreddit
+        print("\nTesting subreddit access...")
+        test_sub = await reddit.subreddit("announcements")
+        async for post in test_sub.hot(limit=1):
+            print("✓ Successfully accessed test subreddit")
+            break
+            
+        print("\n=== All Authentication Tests Passed ===")
+        return True
+    except Exception as e:
+        print(f"\n❌ Reddit authentication test failed: {e}")
+        print("Please verify your Reddit credentials in Render environment settings")
+        print("https://dashboard.render.com > Your Service > Environment")
+        return False
+
+# Add auth test to startup
+@bot.event
+async def on_ready():
+    try:
+        print(f"Bot starting up as {bot.user.name}")
+        
+        # Test Reddit auth first
+        auth_success = await test_reddit_auth()
+        if not auth_success:
+            print("WARNING: Reddit authentication test failed!")
+            
+        # Sync commands globally first
+        await tree.sync()
+        # Then sync to specific guild
+        await tree.sync(guild=discord.Object(id=GUILD_ID))
+        auto_post_loop.start()
+        logging_channel = bot.get_channel(LOGGING_CHANNEL_ID)
+        if logging_channel:
+            status = "✅" if auth_success else "⚠️"
+            await logging_channel.send(
+                f"{status} Bot restarted at {datetime.now(UTC)}\n"
+                f"Reddit auth test: {'Success' if auth_success else 'Failed'}"
+            )
+        print("Bot is ready!")
+    except Exception as e:
+        print(f"Error during startup: {e}")
+        if 'logging_channel' in locals() and logging_channel:
+            await logging_channel.send(f"⚠️ Error during startup: {e}")
 
 async def verify_subreddit_access(sub_name: str):
     """Verify if we can access a subreddit and log detailed error info."""
     try:
-        # Create a task for subreddit access
-        async def access_subreddit():
-            sub = await reddit.subreddit(sub_name)
-            posts = []
-            async for post in sub.new(limit=1):
-                posts.append(post)
-            return len(posts) > 0
-
-        # Run the task with timeout
+        print(f"\nTesting access to r/{sub_name}:")
+        print("1. Getting subreddit instance...")
+        sub = await reddit.subreddit(sub_name)
+        
+        print("2. Attempting to get subreddit info...")
         try:
-            task = asyncio.create_task(access_subreddit())
-            result = await asyncio.wait_for(task, timeout=30.0)
-            if result:
-                print(f"Successfully accessed r/{sub_name}")
+            # Try to get basic info first
+            await sub.load()
+            print(f"Subreddit info loaded: over18={getattr(sub, 'over18', 'unknown')}")
+        except Exception as e:
+            print(f"Note: Could not load subreddit info: {e}")
+            # Continue anyway as this isn't critical
+        
+        print("3. Testing post access...")
+        try:
+            async for post in sub.new(limit=1):
+                print("Successfully got a post!")
                 return True, None
-            else:
-                print(f"No posts found in r/{sub_name}")
-                return False, "No posts found in subreddit"
-        except asyncio.TimeoutError:
-            print(f"Timeout accessing r/{sub_name}")
-            return False, "Request timed out - try again"
+            print("No posts found")
+            return False, "Subreddit exists but has no posts"
         except Exception as e:
             print(f"Error accessing posts: {e}")
-            return False, f"Error accessing posts: {str(e)}"
+            return False, str(e)
 
     except Exception as e:
         print(f"Error in verify_subreddit_access: {e}")
-        return False, f"Error verifying access: {str(e)}"
+        return False, str(e)
 
 async def fetch_post(subreddit: str):
     try:
@@ -455,24 +519,6 @@ async def auto_post_loop():
             continue
 
 # ─── Bot Events ─────────────────────────────────────────────────────────────────
-@bot.event
-async def on_ready():
-    try:
-        print(f"Bot starting up as {bot.user.name}")
-        # Sync commands globally first
-        await tree.sync()
-        # Then sync to specific guild
-        await tree.sync(guild=discord.Object(id=GUILD_ID))
-        auto_post_loop.start()
-        logging_channel = bot.get_channel(LOGGING_CHANNEL_ID)
-        if logging_channel:
-            await logging_channel.send(f"✅ Bot restarted at {datetime.now(UTC)}")
-        print("Bot is ready!")
-    except Exception as e:
-        print(f"Error during startup: {e}")
-        if 'logging_channel' in locals() and logging_channel:
-            await logging_channel.send(f"⚠️ Error during startup: {e}")
-
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.CommandOnCooldown):
