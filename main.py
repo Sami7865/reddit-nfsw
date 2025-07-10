@@ -10,7 +10,7 @@ import asyncio
 import logging
 from flask import Flask
 from threading import Thread
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, UTC  # Add UTC import
 
 import discord
 from discord import app_commands
@@ -139,13 +139,15 @@ async def build_embed(post):
 async def addsub(interaction: discord.Interaction, name: str):
     if not is_admin_or_mod(interaction):
         return await interaction.response.send_message("You must be an admin/mod to use this.", ephemeral=True)
-    await interaction.response.defer(thinking=True)
+    
     try:
-        async def check():
-            sub = await reddit.subreddit(name, fetch=True)
-            if not sub.over18:
-                raise ValueError("Subreddit is not NSFW.")
-        asyncio.create_task(check())  # avoid context manager error
+        # Check subreddit first before deferring
+        sub = await reddit.subreddit(name, fetch=True)
+        if not sub.over18:
+            return await interaction.response.send_message("❌ Subreddit is not NSFW.", ephemeral=True)
+            
+        await interaction.response.defer(thinking=True)
+        
         config_col.update_one(
             {"channel_id": interaction.channel_id},
             {"$addToSet": {"subs": name.lower()}, "$setOnInsert": {
@@ -155,8 +157,14 @@ async def addsub(interaction: discord.Interaction, name: str):
             upsert=True
         )
         await interaction.followup.send(f"✅ Added r/{name} to this channel.")
+    except asyncpraw.exceptions.InvalidURL:
+        await interaction.response.send_message(f"❌ Invalid subreddit name: r/{name}", ephemeral=True)
     except Exception as e:
-        await interaction.followup.send(f"❌ Failed to add r/{name}: {e}")
+        # If we haven't responded yet, send an immediate response
+        try:
+            await interaction.response.send_message(f"❌ Failed to add r/{name}: {e}", ephemeral=True)
+        except discord.errors.InteractionResponded:
+            await interaction.followup.send(f"❌ Failed to add r/{name}: {e}", ephemeral=True)
         await send_error_dm(BOT_OWNER_ID, str(e))
 
 @tree.command(
@@ -255,14 +263,17 @@ async def send(interaction: discord.Interaction):
         
         await interaction.response.defer(thinking=True)
         
-        sub = subs[datetime.utcnow().second % len(subs)]
+        sub = subs[datetime.now(UTC).second % len(subs)]
         post = await fetch_post(sub)
         if not post:
             return await interaction.followup.send("⚠️ No valid post found.")
         embed = await build_embed(post)
         await interaction.followup.send(embed=embed)
     except Exception as e:
-        await interaction.followup.send("❌ Error sending post.", ephemeral=True)
+        try:
+            await interaction.response.send_message("❌ Error sending post.", ephemeral=True)
+        except discord.errors.InteractionResponded:
+            await interaction.followup.send("❌ Error sending post.", ephemeral=True)
         await send_error_dm(BOT_OWNER_ID, str(e))
 
 @tree.command(
@@ -301,7 +312,7 @@ async def forcesend(interaction: discord.Interaction, count: int = 1):
                 
             for _ in range(count):
                 try:
-                    sub = cfg["subs"][datetime.utcnow().second % len(cfg["subs"])]
+                    sub = cfg["subs"][datetime.now(UTC).second % len(cfg["subs"])]
                     post = await fetch_post(sub)
                     if post:
                         embed = await build_embed(post)
@@ -313,7 +324,10 @@ async def forcesend(interaction: discord.Interaction, count: int = 1):
         
         await interaction.followup.send(f"✅ Force send complete!\nSuccess: {success_count}\nFailed: {fail_count}")
     except Exception as e:
-        await interaction.followup.send("❌ Error during force send.", ephemeral=True)
+        try:
+            await interaction.response.send_message("❌ Error during force send.", ephemeral=True)
+        except discord.errors.InteractionResponded:
+            await interaction.followup.send("❌ Error during force send.", ephemeral=True)
         await send_error_dm(BOT_OWNER_ID, str(e))
 
 # ─── Auto Poster Task ───────────────────────────────────────────────────────────
@@ -322,8 +336,8 @@ async def auto_post_loop():
     for cfg in config_col.find():
         channel_id = cfg["channel_id"]
         interval = cfg.get("interval", GLOBAL_POST_INTERVAL)
-        last_time = LAST_SENT.get(channel_id, datetime.min)
-        if datetime.utcnow() - last_time < timedelta(minutes=interval):
+        last_time = LAST_SENT.get(channel_id, datetime.min.replace(tzinfo=UTC))
+        if datetime.now(UTC) - last_time < timedelta(minutes=interval):
             continue
         channel = bot.get_channel(channel_id)
         if not channel:
@@ -331,13 +345,13 @@ async def auto_post_loop():
             continue
         if not cfg.get("subs"):
             continue
-        sub = cfg["subs"][datetime.utcnow().second % len(cfg["subs"])]
+        sub = cfg["subs"][datetime.now(UTC).second % len(cfg["subs"])]
         post = await fetch_post(sub)
         if post:
             try:
                 embed = await build_embed(post)
                 await channel.send(embed=embed)
-                LAST_SENT[channel_id] = datetime.utcnow()
+                LAST_SENT[channel_id] = datetime.now(UTC)
             except Exception:
                 continue
 
@@ -352,7 +366,7 @@ async def on_ready():
         auto_post_loop.start()
         logging_channel = bot.get_channel(LOGGING_CHANNEL_ID)
         if logging_channel:
-            await logging_channel.send(f"✅ Bot restarted at {datetime.utcnow()}")
+            await logging_channel.send(f"✅ Bot restarted at {datetime.now(UTC)}")
     except Exception as e:
         print(f"Error during startup: {e}")
         if logging_channel:
