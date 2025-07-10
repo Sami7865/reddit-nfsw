@@ -84,6 +84,26 @@ config_col = db["configs"]
 sent_media_col = db["sent_media"]
 stats_col = db["stats"]  # New collection for bot statistics
 
+async def is_media_sent(url: str) -> bool:
+    """Check if media URL was already sent in the last week"""
+    try:
+        return bool(sent_media_col.find_one({"url": url}))
+    except Exception as e:
+        print(f"Error checking media sent status: {e}")
+        return False  # On error, allow the post to be sent
+
+async def mark_media_sent(url: str, post_id: str, subreddit: str):
+    """Mark media URL as sent"""
+    try:
+        sent_media_col.insert_one({
+            "url": url,
+            "post_id": post_id,
+            "subreddit": subreddit,
+            "timestamp": datetime.now(UTC)
+        })
+    except Exception as e:
+        print(f"Error marking media as sent: {e}")
+
 # Initialize MongoDB collections and indexes
 async def init_mongodb():
     """Initialize MongoDB collections and indexes"""
@@ -192,6 +212,9 @@ async def setup_reddit():
         requestor_kwargs={"session": session}
     )
     
+    # Enable NSFW content
+    reddit.config.custom_config = {"over_18": True}
+    
     print("Reddit client initialized")
 
 @asynccontextmanager
@@ -201,6 +224,9 @@ async def get_subreddit(name: str):
         await setup_reddit()
     try:
         sub = await reddit.subreddit(name)
+        # Explicitly check and enable NSFW access
+        sub._fetched = True
+        sub.over18 = True
         yield sub
     except Exception as e:
         print(f"Error accessing subreddit r/{name}: {e}")
@@ -213,7 +239,13 @@ async def verify_subreddit_access(sub_name: str):
         
         async def _verify():
             async with get_subreddit(sub_name) as sub:
+                # First verify we can access the subreddit
+                subreddit_info = await sub.load()
+                print(f"Subreddit info - Over 18: {subreddit_info.over18}, Subscribers: {subreddit_info.subscribers}")
+                
+                # Try to get a post to verify content access
                 async for post in sub.new(limit=1):
+                    print(f"Successfully accessed post: {post.url}")
                     return True
             return False
             
@@ -240,6 +272,11 @@ async def fetch_post(subreddit: str):
     try:
         async def _fetch():
             async with get_subreddit(subreddit) as sub:
+                # Verify NSFW access
+                subreddit_info = await sub.load()
+                if not subreddit_info.over18:
+                    print(f"Warning: r/{subreddit} is not marked as NSFW")
+                
                 # Randomly choose a listing type
                 listing_types = ['hot', 'new', 'top', 'rising']
                 listing_type = listing_types[datetime.now(UTC).second % len(listing_types)]
@@ -271,6 +308,7 @@ async def fetch_post(subreddit: str):
                         
                         # Skip if this media was sent in the last week
                         if await is_media_sent(post.url):
+                            print(f"Skipping previously sent: {post.url}")
                             continue
                         
                         # Debug print
@@ -415,7 +453,7 @@ async def build_embed(post):
         print(f"Error building embed: {e}")
         return None
 
-# ─── Commands ───────────────────────────────────────────────────────────────────
+# ─── Discord Commands ─────────────────────────────────────────────────────────────
 @tree.command(
     name="addsub",
     description="Link a subreddit to this channel."
@@ -434,6 +472,19 @@ async def addsub(interaction: discord.Interaction, name: str):
         name = name.strip().lower()
         if name.startswith('r/'):
             name = name[2:]
+            
+        # Basic validation
+        if len(name) < 3:
+            return await interaction.followup.send(
+                "❌ Subreddit name must be at least 3 characters long.",
+                ephemeral=True
+            )
+            
+        if not name.isalnum() and not any(c in name for c in '-_'):
+            return await interaction.followup.send(
+                "❌ Invalid subreddit name. Only letters, numbers, hyphens, and underscores are allowed.",
+                ephemeral=True
+            )
             
         print(f"\nAttempting to add subreddit: r/{name}")
         
@@ -457,7 +508,10 @@ async def addsub(interaction: discord.Interaction, name: str):
         if test_post is None:
             return await interaction.followup.send(
                 f"❌ Could not find any media posts in r/{name}.\n"
-                "Make sure the subreddit contains images or videos.",
+                "Please verify:\n"
+                "1. The subreddit contains images, videos, or GIFs\n"
+                "2. The content is properly marked as NSFW\n"
+                "3. The subreddit is not empty or restricted",
                 ephemeral=True
             )
             
@@ -685,7 +739,6 @@ async def auto_post_loop():
             print(f"Error in auto_post_loop: {e}")
             continue
 
-# Add stats command
 @tree.command(
     name="channelstats",
     description="Show posting statistics for this channel"
