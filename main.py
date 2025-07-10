@@ -80,8 +80,13 @@ reddit = asyncpraw.Reddit(
     client_secret=REDDIT_CLIENT_SECRET,
     username=REDDIT_USERNAME,
     password=REDDIT_PASSWORD,
-    user_agent="Discord NSFW Bot by u/Efficient-Life-554"
+    user_agent="Discord NSFW Bot by u/Efficient-Life-554",
+    check_for_async=False
 )
+
+# Set Reddit client options
+reddit.config.custom_multireddit_fetch = True
+reddit.read_only = False
 
 # ─── Globals ────────────────────────────────────────────────────────────────────
 GLOBAL_POST_INTERVAL = 30  # default to 30 minutes
@@ -102,10 +107,14 @@ def get_config(channel_id: int):
 async def fetch_post(subreddit: str):
     try:
         sub = await reddit.subreddit(subreddit)
-        # Get subreddit info to check NSFW status
-        subreddit_info = await sub.subreddit_type()
-        if subreddit_info != "nsfw":
-            print(f"Subreddit r/{subreddit} is not NSFW")
+        
+        # First try to get basic info
+        try:
+            async for post in sub.hot(limit=1):
+                # If we can get a post, the subreddit exists and we can access it
+                break
+        except Exception as e:
+            print(f"Cannot access r/{subreddit}: {e}")
             return None
             
         posts = []
@@ -152,21 +161,22 @@ async def addsub(interaction: discord.Interaction, name: str):
     await interaction.response.defer(thinking=True)
     
     try:
-        # Check subreddit
+        # Check if we can access the subreddit first
         sub = await reddit.subreddit(name)
         
         try:
-            # Get subreddit info to check NSFW status
-            subreddit_info = await sub.subreddit_type()
-            if subreddit_info != "nsfw":
-                return await interaction.followup.send("❌ Subreddit is not NSFW.", ephemeral=True)
+            # Try to get a post to verify access
+            async for post in sub.hot(limit=1):
+                # We got a post, so we can access the subreddit
+                break
         except Exception as e:
-            return await interaction.followup.send("❌ Could not verify subreddit. It might be private or banned.", ephemeral=True)
+            print(f"Error accessing r/{name}: {e}")
+            return await interaction.followup.send("❌ Could not access this subreddit. Make sure it exists and is not private.", ephemeral=True)
             
-        # Test fetch a post to verify we can access it
+        # Test fetch a post to verify we can get media content
         test_post = await fetch_post(name)
         if test_post is None:
-            return await interaction.followup.send("❌ Could not fetch any posts from this subreddit. Make sure it exists and is accessible.", ephemeral=True)
+            return await interaction.followup.send("❌ Could not find any media posts in this subreddit.", ephemeral=True)
             
         config_col.update_one(
             {"channel_id": interaction.channel_id},
