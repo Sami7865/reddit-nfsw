@@ -102,9 +102,13 @@ def get_config(channel_id: int):
 async def fetch_post(subreddit: str):
     try:
         sub = await reddit.subreddit(subreddit)
+        await sub.load()  # Load subreddit data first
+        if not sub.over18:
+            return None
+            
         posts = []
         async for post in sub.hot(limit=25):
-            if not post.over_18 or post.stickied:
+            if post.stickied:
                 continue
             if post.url.endswith((".jpg", ".png", ".gif", ".jpeg", ".webm", ".mp4")) or "v.redd.it" in post.url:
                 return post
@@ -148,10 +152,15 @@ async def addsub(interaction: discord.Interaction, name: str):
     try:
         # Check subreddit
         sub = await reddit.subreddit(name)
-        is_nsfw = await sub.over18
+        await sub.load()  # Load subreddit data first
         
-        if not is_nsfw:
+        if not sub.over18:
             return await interaction.followup.send("❌ Subreddit is not NSFW.", ephemeral=True)
+            
+        # Test fetch a post to verify we can access it
+        test_post = await fetch_post(name)
+        if test_post is None:
+            return await interaction.followup.send("❌ Could not fetch any posts from this subreddit. Make sure it exists and is accessible.", ephemeral=True)
             
         config_col.update_one(
             {"channel_id": interaction.channel_id},
