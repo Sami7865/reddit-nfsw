@@ -1,4 +1,3 @@
-
 import sys
 
 # Monkey-patch to fake audioop for discord.py on Python 3.13+
@@ -192,51 +191,29 @@ async def update_channel_stats(channel_id: int, post_url: str, subreddit: str):
 session = None
 reddit = None
 
-async def setup_reddit():
-    """Setup Reddit client with proper session"""
-    global session, reddit
-    
-    # Create custom session with proper configuration
-    timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=10)
-    session = aiohttp.ClientSession(timeout=timeout)
-    
-    # Initialize Reddit client with script-type user agent
-    USER_AGENT = f"render:discord.nsfw.bot:v1.0 (by /u/{REDDIT_USERNAME})"
-    print(f"User Agent: {USER_AGENT}")
-    
-    reddit = asyncpraw.Reddit(
-        client_id=REDDIT_CLIENT_ID,
-        client_secret=REDDIT_CLIENT_SECRET,
-        username=REDDIT_USERNAME,
-        password=REDDIT_PASSWORD,
-        user_agent=USER_AGENT,
-        requestor_kwargs={"session": session}
-    )
-    
-    # Enable NSFW content
-    reddit.config.custom_config = {"over_18": True}
-    reddit.config.custom_config["nsfw"] = True
-    
-    # Verify the account is configured for NSFW content
-    me = await reddit.user.me()
-    print("\nReddit account configuration:")
-    print(f"- Username: {me.name}")
-    print(f"- Over 18: {getattr(me, 'over_18', 'unknown')}")
-    print(f"- NSFW allowed: {getattr(me, 'nsfw_allowed', 'unknown')}")
-    
-    print("Reddit client initialized with NSFW access enabled")
-
 @asynccontextmanager
 async def get_subreddit(name: str):
     """Safely get a subreddit with proper timeout handling."""
     if reddit is None:
         await setup_reddit()
     try:
-        sub = await reddit.subreddit(name)
+        # First check if we can access the subreddit at all
+        sub = await reddit.subreddit(name, fetch=True)
+        if not sub:
+            raise Exception("Could not access subreddit")
+            
         # Force NSFW access
         sub._fetched = True
         sub.over18 = True
         sub.nsfw = True
+        
+        # Try to load subreddit info
+        try:
+            await sub.load()
+        except Exception as e:
+            print(f"Warning: Could not load subreddit info: {e}")
+            # Continue anyway as we might still be able to access posts
+            
         yield sub
     except Exception as e:
         print(f"Error accessing subreddit r/{name}: {e}")
@@ -248,31 +225,45 @@ async def verify_subreddit_access(sub_name: str):
         print(f"\nTesting access to r/{sub_name}")
         
         async def _verify():
-            async with get_subreddit(sub_name) as sub:
-                # First verify we can access the subreddit
-                subreddit_info = await sub.load()
-                print(f"Subreddit info:")
-                print(f"- Over 18: {getattr(subreddit_info, 'over18', 'unknown')}")
-                print(f"- NSFW: {getattr(subreddit_info, 'nsfw', 'unknown')}")
-                print(f"- Subscribers: {getattr(subreddit_info, 'subscribers', 0)}")
-                print(f"- Description: {getattr(subreddit_info, 'description', '')[:100]}...")
-                
-                # Try to get a post to verify content access
-                posts_found = False
-                async for post in sub.new(limit=5):
-                    posts_found = True
-                    print(f"Test post found: {post.url}")
-                    print(f"- Is video: {getattr(post, 'is_video', False)}")
-                    print(f"- Post hint: {getattr(post, 'post_hint', 'unknown')}")
-                    print(f"- Has media: {bool(getattr(post, 'media', None))}")
-                    break
-                
-                if posts_found:
-                    print(f"Successfully accessed r/{sub_name}")
+            try:
+                async with get_subreddit(sub_name) as sub:
+                    # Try to get posts first since that's what we really need
+                    posts_found = False
+                    media_found = False
+                    
+                    print("\nTesting post access...")
+                    async for post in sub.new(limit=10):
+                        posts_found = True
+                        
+                        # Check if it's a media post
+                        if (
+                            # Direct images
+                            any(post.url.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".gif"]) or
+                            # Reddit videos
+                            (hasattr(post, 'media') and post.media and post.media.get("reddit_video")) or
+                            # Redgifs/Gfycat
+                            any(domain in post.url.lower() for domain in ["redgifs.com", "gfycat.com"]) or
+                            # Imgur
+                            "imgur.com" in post.url.lower()
+                        ):
+                            media_found = True
+                            print(f"Found media post: {post.url}")
+                            print(f"- Type: {getattr(post, 'post_hint', 'unknown')}")
+                            print(f"- Has media: {bool(getattr(post, 'media', None))}")
+                            break
+                            
+                    if not posts_found:
+                        return False, "Could not find any posts in subreddit"
+                    
+                    if not media_found:
+                        return False, "Could not find any media posts in subreddit"
+                        
+                    print(f"Successfully verified media content in r/{sub_name}")
                     return True, None
-                else:
-                    print(f"No posts found in r/{sub_name}")
-                    return False, "Subreddit exists but has no posts"
+                    
+            except Exception as e:
+                print(f"Error during verification: {e}")
+                return False, str(e)
             
         # Create and run task with timeout
         task = asyncio.create_task(_verify())
@@ -286,24 +277,62 @@ async def verify_subreddit_access(sub_name: str):
         print(f"Error verifying access: {e}")
         return False, str(e)
 
+async def setup_reddit():
+    """Setup Reddit client with proper session"""
+    global session, reddit
+    
+    try:
+        # Create custom session with proper configuration
+        timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=10)
+        session = aiohttp.ClientSession(timeout=timeout)
+        
+        # Initialize Reddit client with script-type user agent
+        USER_AGENT = f"render:discord.nsfw.bot:v1.0 (by /u/{REDDIT_USERNAME})"
+        print(f"User Agent: {USER_AGENT}")
+        
+        reddit = asyncpraw.Reddit(
+            client_id=REDDIT_CLIENT_ID,
+            client_secret=REDDIT_CLIENT_SECRET,
+            username=REDDIT_USERNAME,
+            password=REDDIT_PASSWORD,
+            user_agent=USER_AGENT,
+            requestor_kwargs={"session": session}
+        )
+        
+        # Enable NSFW content
+        reddit.config.custom_config = {
+            "over_18": True,
+            "nsfw": True,
+            "risky_mode_enabled": True
+        }
+        
+        # Verify the account is configured for NSFW content
+        me = await reddit.user.me()
+        print("\nReddit account configuration:")
+        print(f"- Username: {me.name}")
+        print(f"- Over 18: {getattr(me, 'over_18', 'unknown')}")
+        print(f"- NSFW allowed: {getattr(me, 'nsfw_allowed', 'unknown')}")
+        
+        # Test NSFW access
+        test_sub = await reddit.subreddit("gonewild", fetch=True)  # Common NSFW sub for testing
+        if test_sub:
+            print("✅ NSFW access verified")
+        
+        print("Reddit client initialized with NSFW access enabled")
+        
+    except Exception as e:
+        print(f"Error setting up Reddit client: {e}")
+        raise
+
 async def fetch_post(subreddit: str):
     """Fetch a media post from the subreddit with variety."""
     try:
         async def _fetch():
             async with get_subreddit(subreddit) as sub:
-                # Verify NSFW access
-                subreddit_info = await sub.load()
                 print(f"\nFetching from r/{subreddit}")
-                print(f"Subreddit info - Over 18: {subreddit_info.over18}, Subscribers: {subreddit_info.subscribers}")
-                
-                # Randomly choose a listing type
-                listing_types = ['hot', 'new']  # Removed top and rising as they can be unreliable
-                listing_type = listing_types[datetime.now(UTC).second % len(listing_types)]
-                
-                print(f"Using {listing_type} listing")
                 
                 # Get the appropriate listing
-                listing = getattr(sub, listing_type)(limit=50)  # Reduced limit for faster response
+                listing = sub.new(limit=50)  # Use new for most recent posts
                 
                 valid_posts = []
                 seen_urls = set()
@@ -313,61 +342,68 @@ async def fetch_post(subreddit: str):
                     processed_count += 1
                     try:
                         if post.stickied or post.is_self:
-                            print(f"Skipping {'stickied' if post.stickied else 'self'} post")
                             continue
                             
                         # Skip if we've seen this URL before
                         if post.url in seen_urls:
-                            print(f"Skipping duplicate URL: {post.url}")
                             continue
                         seen_urls.add(post.url)
                         
                         # Skip if this media was sent in the last week
                         if await is_media_sent(post.url):
-                            print(f"Skipping previously sent: {post.url}")
                             continue
                         
                         print(f"\nChecking post: {post.url}")
-                        print(f"Post type hints - is_video: {getattr(post, 'is_video', False)}, post_hint: {getattr(post, 'post_hint', 'unknown')}")
                         
                         # Check for various media types
                         is_valid = False
                         media_type = "unknown"
+                        media_url = None
                         
                         # Direct image links
                         if any(post.url.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".gif"]):
-                            print(f"Found direct image: {post.url}")
                             is_valid = True
                             media_type = "direct_image"
+                            media_url = post.url
                         
                         # Reddit-hosted videos
                         elif "v.redd.it" in post.url:
                             if hasattr(post, 'media') and post.media and post.media.get("reddit_video"):
-                                print(f"Found Reddit video: {post.url}")
-                                print(f"Video details: {post.media['reddit_video']}")
-                                is_valid = True
-                                media_type = "reddit_video"
+                                video_data = post.media["reddit_video"]
+                                if video_data.get("fallback_url"):
+                                    is_valid = True
+                                    media_type = "reddit_video"
+                                    media_url = video_data["fallback_url"]
                         
                         # Redgifs links
                         elif any(domain in post.url.lower() for domain in ["redgifs.com", "gfycat.com"]):
-                            print(f"Found Redgifs/Gfycat: {post.url}")
                             is_valid = True
                             media_type = "redgifs"
+                            media_url = post.url
                         
                         # Imgur links
                         elif "imgur.com" in post.url.lower():
-                            print(f"Found Imgur: {post.url}")
+                            # Convert imgur links to direct images if possible
+                            if not any(post.url.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".gif"]):
+                                if "/a/" not in post.url:  # Not an album
+                                    media_url = post.url + ".jpg"
+                                else:
+                                    media_url = post.url
+                            else:
+                                media_url = post.url
                             is_valid = True
                             media_type = "imgur"
                             
-                        if is_valid:
-                            print(f"✅ Valid {media_type} post found: {post.url}")
+                        if is_valid and media_url:
+                            print(f"✅ Valid {media_type} post found: {media_url}")
+                            post.media_url = media_url  # Store the media URL for later use
+                            post.media_type = media_type
                             valid_posts.append(post)
                             
                             # If we have enough posts, randomly select one
-                            if len(valid_posts) >= 10:  # Reduced threshold for faster response
+                            if len(valid_posts) >= 10:
                                 selected_post = valid_posts[datetime.now(UTC).microsecond % len(valid_posts)]
-                                await mark_media_sent(selected_post.url, selected_post.id, str(selected_post.subreddit))
+                                await mark_media_sent(selected_post.media_url, selected_post.id, str(selected_post.subreddit))
                                 return selected_post
                     except Exception as post_error:
                         print(f"Error processing post: {post_error}")
@@ -375,12 +411,11 @@ async def fetch_post(subreddit: str):
                 
                 print(f"\nProcessed {processed_count} posts total")
                 print(f"Found {len(valid_posts)} valid media posts")
-                print(f"Skipped {len(seen_urls) - len(valid_posts)} non-media posts")
                 
                 # If we have any valid posts, randomly select one
                 if valid_posts:
                     selected_post = valid_posts[datetime.now(UTC).microsecond % len(valid_posts)]
-                    await mark_media_sent(selected_post.url, selected_post.id, str(selected_post.subreddit))
+                    await mark_media_sent(selected_post.media_url, selected_post.id, str(selected_post.subreddit))
                     return selected_post
                     
                 print(f"No valid posts found in r/{subreddit} (checked {len(seen_urls)} posts)")
@@ -392,7 +427,7 @@ async def fetch_post(subreddit: str):
         post = await asyncio.wait_for(task, timeout=30.0)
         
         if post:
-            print(f"Successfully fetched post from r/{subreddit}: {post.url}")
+            print(f"Successfully fetched {post.media_type} post from r/{subreddit}: {post.media_url}")
             return post
         print(f"No media posts found in r/{subreddit}")
         return None
@@ -447,31 +482,27 @@ async def build_embed(post):
             color=discord.Color.red()
         )
         
-        # Handle different types of media
-        if "v.redd.it" in post.url and hasattr(post, 'media') and post.media:
-            video_url = post.media.get("reddit_video", {}).get("fallback_url")
-            if video_url:
-                embed.add_field(name="Video", value=video_url, inline=False)
-                # Add thumbnail if available
-                if hasattr(post, 'thumbnail') and post.thumbnail != 'default':
-                    embed.set_thumbnail(url=post.thumbnail)
+        # Use the media_url we stored earlier
+        media_type = getattr(post, 'media_type', 'unknown')
+        media_url = getattr(post, 'media_url', post.url)
         
-        elif "redgifs.com" in post.url or "gfycat.com" in post.url:
-            embed.add_field(name="GIF", value=post.url, inline=False)
+        print(f"Building embed for {media_type} post: {media_url}")
+        
+        if media_type == "reddit_video":
+            # For Reddit videos, add both the video URL and a thumbnail
+            embed.add_field(name="Video", value=media_url, inline=False)
             if hasattr(post, 'thumbnail') and post.thumbnail != 'default':
                 embed.set_thumbnail(url=post.thumbnail)
-        
-        elif "imgur.com" in post.url:
-            # Convert imgur links to direct images if possible
-            if not any(post.url.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".gif"]):
-                if "/a/" not in post.url:  # Not an album
-                    image_url = post.url + ".jpg"
-                    embed.set_image(url=image_url)
-            else:
-                embed.set_image(url=post.url)
-        
-        elif post.url:  # Direct image links
-            embed.set_image(url=post.url)
+                
+        elif media_type == "redgifs":
+            # For Redgifs, add the URL and thumbnail if available
+            embed.add_field(name="GIF", value=media_url, inline=False)
+            if hasattr(post, 'thumbnail') and post.thumbnail != 'default':
+                embed.set_thumbnail(url=post.thumbnail)
+                
+        elif media_type in ["direct_image", "imgur"]:
+            # For images and Imgur links, set the image directly
+            embed.set_image(url=media_url)
         
         embed.set_footer(text=f"Posted by u/{post.author} in r/{post.subreddit}")
         return embed
@@ -575,8 +606,8 @@ async def removesub(interaction: discord.Interaction, name: str):
     if not is_admin_or_mod(interaction):
         return await interaction.response.send_message("You must be an admin/mod to use this.", ephemeral=True)
     try:
-        config_col.update_one({"channel_id": interaction.channel_id}, {"$pull": {"subs": name.lower()}})
-        await interaction.response.send_message(f"🗑️ Removed r/{name} from this channel.")
+    config_col.update_one({"channel_id": interaction.channel_id}, {"$pull": {"subs": name.lower()}})
+    await interaction.response.send_message(f"🗑️ Removed r/{name} from this channel.")
     except Exception as e:
         await interaction.response.send_message(f"❌ Error removing subreddit: {e}", ephemeral=True)
         await send_error_dm(BOT_OWNER_ID, str(e))
@@ -589,9 +620,9 @@ async def listsubs(interaction: discord.Interaction):
     try:
         await interaction.response.defer(thinking=True)
         
-        cfg = get_config(interaction.channel_id)
-        subs = cfg.get("subs", [])
-        if not subs:
+    cfg = get_config(interaction.channel_id)
+    subs = cfg.get("subs", [])
+    if not subs:
             return await interaction.followup.send("❌ No subreddits linked.")
         await interaction.followup.send("📜 Subreddits:\n" + "\n".join(f"- r/{s}" for s in subs))
     except Exception as e:
@@ -618,8 +649,8 @@ async def setinterval(interaction: discord.Interaction, minutes: int):
     try:
         if not 1 <= minutes <= 1440:
             return await interaction.response.send_message("❌ Interval must be between 1 and 1440 minutes.", ephemeral=True)
-        config_col.update_one({"channel_id": interaction.channel_id}, {"$set": {"interval": minutes}})
-        await interaction.response.send_message(f"⏱️ Interval set to {minutes} min.")
+    config_col.update_one({"channel_id": interaction.channel_id}, {"$set": {"interval": minutes}})
+    await interaction.response.send_message(f"⏱️ Interval set to {minutes} min.")
     except Exception as e:
         await interaction.response.send_message("❌ Error setting interval.", ephemeral=True)
         await send_error_dm(BOT_OWNER_ID, str(e))
@@ -643,9 +674,9 @@ async def setglobalinterval(interaction: discord.Interaction, minutes: int):
     try:
         if not 1 <= minutes <= 1440:
             return await interaction.response.send_message("❌ Interval must be between 1 and 1440 minutes.", ephemeral=True)
-        global GLOBAL_POST_INTERVAL
-        GLOBAL_POST_INTERVAL = minutes
-        await interaction.response.send_message(f"🌐 Global interval set to {minutes} min.")
+    global GLOBAL_POST_INTERVAL
+    GLOBAL_POST_INTERVAL = minutes
+    await interaction.response.send_message(f"🌐 Global interval set to {minutes} min.")
     except Exception as e:
         await interaction.response.send_message("❌ Error setting global interval.", ephemeral=True)
         await send_error_dm(BOT_OWNER_ID, str(e))
@@ -658,17 +689,17 @@ async def send(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True)
     
     try:
-        cfg = get_config(interaction.channel_id)
-        subs = cfg.get("subs", [])
-        if not subs:
+    cfg = get_config(interaction.channel_id)
+    subs = cfg.get("subs", [])
+    if not subs:
             return await interaction.followup.send("❌ No subreddits linked.")
         
         sub = subs[datetime.now(UTC).second % len(subs)]
-        post = await fetch_post(sub)
-        if not post:
+    post = await fetch_post(sub)
+    if not post:
             return await interaction.followup.send("⚠️ No valid post found.")
         
-        embed = await build_embed(post)
+    embed = await build_embed(post)
         if not embed:
             return await interaction.followup.send("⚠️ Failed to create embed.")
             
@@ -704,11 +735,11 @@ async def forcesend(interaction: discord.Interaction, count: int = 1):
         success_count = 0
         fail_count = 0
         
-        for cfg in config_col.find():
-            channel = bot.get_channel(cfg["channel_id"])
-            if not channel:
-                config_col.delete_one({"channel_id": cfg["channel_id"]})
-                continue
+    for cfg in config_col.find():
+        channel = bot.get_channel(cfg["channel_id"])
+        if not channel:
+            config_col.delete_one({"channel_id": cfg["channel_id"]})
+            continue
                 
             if "subs" not in cfg or not cfg["subs"]:
                 continue
@@ -718,9 +749,9 @@ async def forcesend(interaction: discord.Interaction, count: int = 1):
                     sub = cfg["subs"][datetime.now(UTC).second % len(cfg["subs"])]
                     post = await fetch_post(sub)
                     if post:
-                        embed = await build_embed(post)
+                    embed = await build_embed(post)
                         if embed:
-                            await channel.send(embed=embed)
+                    await channel.send(embed=embed)
                             success_count += 1
                 except Exception as e:
                     print(f"Error in forcesend for r/{sub}: {e}")
@@ -738,33 +769,33 @@ async def forcesend(interaction: discord.Interaction, count: int = 1):
 async def auto_post_loop():
     for cfg in config_col.find():
         try:
-            channel_id = cfg["channel_id"]
-            interval = cfg.get("interval", GLOBAL_POST_INTERVAL)
+        channel_id = cfg["channel_id"]
+        interval = cfg.get("interval", GLOBAL_POST_INTERVAL)
             last_time = LAST_SENT.get(channel_id, datetime.min.replace(tzinfo=UTC))
             
             if datetime.now(UTC) - last_time < timedelta(minutes=interval):
-                continue
+            continue
                 
-            channel = bot.get_channel(channel_id)
-            if not channel:
-                config_col.delete_one({"channel_id": channel_id})
-                continue
+        channel = bot.get_channel(channel_id)
+        if not channel:
+            config_col.delete_one({"channel_id": channel_id})
+            continue
                 
-            if not cfg.get("subs"):
-                continue
+        if not cfg.get("subs"):
+            continue
                 
             sub = cfg["subs"][datetime.now(UTC).second % len(cfg["subs"])]
-            post = await fetch_post(sub)
-            if post:
+        post = await fetch_post(sub)
+        if post:
                 embed = await build_embed(post)
                 if embed:
-                    await channel.send(embed=embed)
+                await channel.send(embed=embed)
                     LAST_SENT[channel_id] = datetime.now(UTC)
                     await save_last_sent()
                     await update_channel_stats(channel_id, post.url, str(post.subreddit))
         except Exception as e:
             print(f"Error in auto_post_loop: {e}")
-            continue
+                continue
 
 @tree.command(
     name="channelstats",
@@ -833,10 +864,10 @@ async def on_ready():
             print(f"Error syncing commands: {sync_error}")
         
         # Start auto posting
-        auto_post_loop.start()
+    auto_post_loop.start()
         
-        logging_channel = bot.get_channel(LOGGING_CHANNEL_ID)
-        if logging_channel:
+    logging_channel = bot.get_channel(LOGGING_CHANNEL_ID)
+    if logging_channel:
             status = "✅" if auth_success else "⚠️"
             await logging_channel.send(
                 f"{status} Bot restarted at {datetime.now(UTC)}\n"
