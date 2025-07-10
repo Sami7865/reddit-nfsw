@@ -18,6 +18,7 @@ from discord.ext import commands, tasks
 
 from pymongo import MongoClient
 import asyncpraw
+from discord.errors import LoginFailure
 
 # ─── Flask Keepalive Server ─────────────────────────────────────────────────────
 app = Flask(__name__)
@@ -100,12 +101,12 @@ def get_config(channel_id: int):
 
 async def fetch_post(subreddit: str):
     try:
-        async with reddit.subreddit(subreddit) as sub:
-            async for post in sub.hot(limit=25):
-                if not post.over_18 or post.stickied:
-                    continue
-                if post.url.endswith((".jpg", ".png", ".gif", ".jpeg", ".webm", ".mp4")) or "v.redd.it" in post.url:
-                    return post
+        sub = await reddit.subreddit(subreddit)
+        async for post in sub.hot(limit=25):
+            if not post.over_18 or post.stickied:
+                continue
+            if post.url.endswith((".jpg", ".png", ".gif", ".jpeg", ".webm", ".mp4")) or "v.redd.it" in post.url:
+                return post
         return None
     except Exception as e:
         print(f"Error fetching post from r/{subreddit}: {e}")
@@ -142,13 +143,15 @@ async def addsub(interaction: discord.Interaction, name: str):
         return await interaction.response.send_message("You must be an admin/mod to use this.", ephemeral=True)
     
     try:
-        # Check subreddit first before deferring
-        async with reddit.subreddit(name) as sub:
-            if not sub.over18:
-                return await interaction.response.send_message("❌ Subreddit is not NSFW.", ephemeral=True)
-            
         await interaction.response.defer(thinking=True)
         
+        # Check subreddit
+        sub = await reddit.subreddit(name)
+        await sub.load()  # This ensures the subreddit exists and loads its data
+        
+        if not sub.over18:
+            return await interaction.followup.send("❌ Subreddit is not NSFW.", ephemeral=True)
+            
         config_col.update_one(
             {"channel_id": interaction.channel_id},
             {"$addToSet": {"subs": name.lower()}, "$setOnInsert": {
@@ -159,13 +162,10 @@ async def addsub(interaction: discord.Interaction, name: str):
         )
         await interaction.followup.send(f"✅ Added r/{name} to this channel.")
     except asyncpraw.exceptions.InvalidURL:
-        await interaction.response.send_message(f"❌ Invalid subreddit name: r/{name}", ephemeral=True)
+        await interaction.followup.send(f"❌ Invalid subreddit name: r/{name}", ephemeral=True)
     except Exception as e:
-        # If we haven't responded yet, send an immediate response
-        try:
-            await interaction.response.send_message(f"❌ Failed to add r/{name}: {e}", ephemeral=True)
-        except discord.errors.InteractionResponded:
-            await interaction.followup.send(f"❌ Failed to add r/{name}: {e}", ephemeral=True)
+        print(f"Error in addsub: {e}")
+        await interaction.followup.send(f"❌ Failed to add r/{name}: {str(e)}", ephemeral=True)
         await send_error_dm(BOT_OWNER_ID, str(e))
 
 @tree.command(
@@ -191,13 +191,16 @@ async def removesub(interaction: discord.Interaction, name: str):
 )
 async def listsubs(interaction: discord.Interaction):
     try:
+        await interaction.response.defer(thinking=True)
+        
         cfg = get_config(interaction.channel_id)
         subs = cfg.get("subs", [])
         if not subs:
-            return await interaction.response.send_message("❌ No subreddits linked.")
-        await interaction.response.send_message("📜 Subreddits:\n" + "\n".join(f"- r/{s}" for s in subs))
+            return await interaction.followup.send("❌ No subreddits linked.")
+        await interaction.followup.send("📜 Subreddits:\n" + "\n".join(f"- r/{s}" for s in subs))
     except Exception as e:
-        await interaction.response.send_message("❌ Error listing subreddits.", ephemeral=True)
+        print(f"Error in listsubs: {e}")
+        await interaction.followup.send("❌ Error listing subreddits.", ephemeral=True)
         await send_error_dm(BOT_OWNER_ID, str(e))
 
 @tree.command(
@@ -257,12 +260,12 @@ async def setglobalinterval(interaction: discord.Interaction, minutes: int):
 )
 async def send(interaction: discord.Interaction):
     try:
+        await interaction.response.defer(thinking=True)
+        
         cfg = get_config(interaction.channel_id)
         subs = cfg.get("subs", [])
         if not subs:
-            return await interaction.response.send_message("❌ No subreddits linked.")
-        
-        await interaction.response.defer(thinking=True)
+            return await interaction.followup.send("❌ No subreddits linked.")
         
         sub = subs[datetime.now(UTC).second % len(subs)]
         post = await fetch_post(sub)
@@ -271,10 +274,8 @@ async def send(interaction: discord.Interaction):
         embed = await build_embed(post)
         await interaction.followup.send(embed=embed)
     except Exception as e:
-        try:
-            await interaction.response.send_message("❌ Error sending post.", ephemeral=True)
-        except discord.errors.InteractionResponded:
-            await interaction.followup.send("❌ Error sending post.", ephemeral=True)
+        print(f"Error in send: {e}")
+        await interaction.followup.send("❌ Error sending post.", ephemeral=True)
         await send_error_dm(BOT_OWNER_ID, str(e))
 
 @tree.command(
@@ -294,10 +295,10 @@ async def forcesend(interaction: discord.Interaction, count: int = 1):
     if not is_admin_or_mod(interaction):
         return await interaction.response.send_message("Admin only.", ephemeral=True)
     try:
-        if not 1 <= count <= 5:
-            return await interaction.response.send_message("❌ Count must be between 1 and 5.", ephemeral=True)
-            
         await interaction.response.defer(thinking=True)
+        
+        if not 1 <= count <= 5:
+            return await interaction.followup.send("❌ Count must be between 1 and 5.", ephemeral=True)
         
         success_count = 0
         fail_count = 0
@@ -325,10 +326,8 @@ async def forcesend(interaction: discord.Interaction, count: int = 1):
         
         await interaction.followup.send(f"✅ Force send complete!\nSuccess: {success_count}\nFailed: {fail_count}")
     except Exception as e:
-        try:
-            await interaction.response.send_message("❌ Error during force send.", ephemeral=True)
-        except discord.errors.InteractionResponded:
-            await interaction.followup.send("❌ Error during force send.", ephemeral=True)
+        print(f"Error in forcesend: {e}")
+        await interaction.followup.send("❌ Error during force send.", ephemeral=True)
         await send_error_dm(BOT_OWNER_ID, str(e))
 
 # ─── Auto Poster Task ───────────────────────────────────────────────────────────
@@ -381,4 +380,41 @@ async def on_command_error(ctx, error):
         await send_error_dm(BOT_OWNER_ID, str(error))
 
 # ─── Run Bot ────────────────────────────────────────────────────────────────────
-bot.run(TOKEN)
+MAX_RETRIES = 5
+RETRY_DELAY = 60  # seconds
+
+async def start_bot():
+    retries = 0
+    while retries < MAX_RETRIES:
+        try:
+            print(f"Starting bot (attempt {retries + 1}/{MAX_RETRIES})...")
+            await bot.start(TOKEN)
+            break
+        except LoginFailure as e:
+            retries += 1
+            print(f"Failed to login (attempt {retries}/{MAX_RETRIES}): {e}")
+            if retries < MAX_RETRIES:
+                wait_time = RETRY_DELAY * retries
+                print(f"Waiting {wait_time} seconds before retrying...")
+                await asyncio.sleep(wait_time)
+            else:
+                print("Max retries reached. Exiting...")
+                sys.exit(1)
+        except Exception as e:
+            retries += 1
+            print(f"Unexpected error (attempt {retries}/{MAX_RETRIES}): {e}")
+            if retries < MAX_RETRIES:
+                wait_time = RETRY_DELAY * retries
+                print(f"Waiting {wait_time} seconds before retrying...")
+                await asyncio.sleep(wait_time)
+            else:
+                print("Max retries reached. Exiting...")
+                sys.exit(1)
+
+try:
+    asyncio.run(start_bot())
+except KeyboardInterrupt:
+    print("Bot stopped by user")
+except Exception as e:
+    print(f"Fatal error: {e}")
+    sys.exit(1)
