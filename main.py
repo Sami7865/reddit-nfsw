@@ -81,6 +81,90 @@ tree = bot.tree
 mongo_client = MongoClient(MONGO_URI)
 db = mongo_client["reddit_bot"]
 config_col = db["configs"]
+sent_media_col = db["sent_media"]
+stats_col = db["stats"]  # New collection for bot statistics
+
+# Initialize MongoDB collections and indexes
+async def init_mongodb():
+    """Initialize MongoDB collections and indexes"""
+    try:
+        # Create TTL index for sent_media if it doesn't exist
+        if "timestamp_1" not in sent_media_col.index_information():
+            sent_media_col.create_index("timestamp", expireAfterSeconds=7 * 24 * 60 * 60)
+            print("Created TTL index for sent_media collection")
+            
+        # Create indexes for faster lookups
+        config_col.create_index("channel_id", unique=True)
+        sent_media_col.create_index("url")
+        stats_col.create_index("type")
+        
+        # Initialize or recover LAST_SENT from MongoDB
+        global LAST_SENT
+        stored_times = stats_col.find_one({"type": "last_sent"})
+        if stored_times:
+            LAST_SENT = {int(k): datetime.fromisoformat(v) for k, v in stored_times["data"].items()}
+            print(f"Recovered timing data for {len(LAST_SENT)} channels")
+        
+        # Validate existing configs
+        invalid_channels = []
+        for cfg in config_col.find():
+            channel_id = cfg.get("channel_id")
+            if not channel_id:
+                invalid_channels.append(cfg["_id"])
+                continue
+                
+            # Ensure required fields exist
+            updates = {}
+            if "interval" not in cfg:
+                updates["interval"] = GLOBAL_POST_INTERVAL
+            if "subs" not in cfg:
+                updates["subs"] = []
+            if "added_at" not in cfg:
+                updates["added_at"] = datetime.now(UTC)
+            if "last_post_time" not in cfg:
+                updates["last_post_time"] = datetime.min.replace(tzinfo=UTC)
+                
+            if updates:
+                config_col.update_one({"_id": cfg["_id"]}, {"$set": updates})
+        
+        # Remove invalid configs
+        if invalid_channels:
+            config_col.delete_many({"_id": {"$in": invalid_channels}})
+            print(f"Removed {len(invalid_channels)} invalid channel configurations")
+            
+        print("MongoDB initialization complete")
+        return True
+        
+    except Exception as e:
+        print(f"Error initializing MongoDB: {e}")
+        return False
+
+async def save_last_sent():
+    """Save LAST_SENT times to MongoDB"""
+    try:
+        # Convert datetime objects to ISO format strings for MongoDB storage
+        data = {str(k): v.isoformat() for k, v in LAST_SENT.items()}
+        stats_col.update_one(
+            {"type": "last_sent"},
+            {"$set": {"data": data, "updated_at": datetime.now(UTC)}},
+            upsert=True
+        )
+    except Exception as e:
+        print(f"Error saving last sent times: {e}")
+
+async def update_channel_stats(channel_id: int, post_url: str, subreddit: str):
+    """Update channel posting statistics"""
+    try:
+        stats_col.update_one(
+            {"type": "channel_stats", "channel_id": channel_id},
+            {
+                "$inc": {"total_posts": 1, f"subreddit_counts.{subreddit}": 1},
+                "$set": {"last_post_url": post_url, "last_post_time": datetime.now(UTC)}
+            },
+            upsert=True
+        )
+    except Exception as e:
+        print(f"Error updating channel stats: {e}")
 
 # ─── Reddit Client ──────────────────────────────────────────────────────────────
 # Global session variable
@@ -152,15 +236,74 @@ async def verify_subreddit_access(sub_name: str):
         return False, str(e)
 
 async def fetch_post(subreddit: str):
-    """Fetch a media post from the subreddit."""
+    """Fetch a media post from the subreddit with variety."""
     try:
         async def _fetch():
             async with get_subreddit(subreddit) as sub:
-                async for post in sub.hot(limit=25):
-                    if post.stickied:
+                # Randomly choose a listing type
+                listing_types = ['hot', 'new', 'top', 'rising']
+                listing_type = listing_types[datetime.now(UTC).second % len(listing_types)]
+                
+                # For top posts, randomly choose a time filter
+                time_filters = ['day', 'week', 'month', 'year', 'all']
+                time_filter = time_filters[datetime.now(UTC).minute % len(time_filters)]
+                
+                # Get the appropriate listing
+                if listing_type == 'top':
+                    listing = sub.top(time_filter=time_filter, limit=100)  # Increased limit for more options
+                else:
+                    listing = getattr(sub, listing_type)(limit=100)
+                
+                valid_posts = []
+                seen_urls = set()
+                
+                async for post in listing:
+                    if post.stickied or post.is_self:
                         continue
-                    if post.url.endswith((".jpg", ".png", ".gif", ".jpeg", ".webm", ".mp4")) or "v.redd.it" in post.url:
-                        return post
+                        
+                    # Skip if we've seen this URL before
+                    if post.url in seen_urls:
+                        continue
+                    seen_urls.add(post.url)
+                    
+                    # Skip if this media was sent in the last week
+                    if await is_media_sent(post.url):
+                        continue
+                    
+                    # Check for various media types
+                    is_valid = False
+                    
+                    # Direct image links
+                    if post.url.endswith((".jpg", ".png", ".gif", ".jpeg")):
+                        is_valid = True
+                    
+                    # Reddit-hosted videos
+                    elif "v.redd.it" in post.url and post.media:
+                        if post.media.get("reddit_video", {}).get("fallback_url"):
+                            is_valid = True
+                    
+                    # Redgifs links
+                    elif "redgifs.com" in post.url or "gfycat.com" in post.url:
+                        is_valid = True
+                    
+                    # Imgur links
+                    elif "imgur.com" in post.url:
+                        is_valid = True
+                        
+                    if is_valid:
+                        valid_posts.append(post)
+                        
+                        # If we have enough posts, randomly select one
+                        if len(valid_posts) >= 25:
+                            selected_post = valid_posts[datetime.now(UTC).microsecond % len(valid_posts)]
+                            await mark_media_sent(selected_post.url, selected_post.id, str(selected_post.subreddit))
+                            return selected_post
+                
+                # If we have any valid posts, randomly select one
+                if valid_posts:
+                    selected_post = valid_posts[datetime.now(UTC).microsecond % len(valid_posts)]
+                    await mark_media_sent(selected_post.url, selected_post.id, str(selected_post.subreddit))
+                    return selected_post
                 return None
 
         # Create and run task with timeout
@@ -168,6 +311,7 @@ async def fetch_post(subreddit: str):
         post = await asyncio.wait_for(task, timeout=30.0)
         
         if post:
+            print(f"Fetched {post.url} from r/{subreddit} ({post.title[:30]}...)")
             return post
         print(f"No media posts found in r/{subreddit}")
         return None
@@ -178,6 +322,22 @@ async def fetch_post(subreddit: str):
     except Exception as e:
         print(f"Error fetching post: {e}")
         return None
+
+# Add a command to clear the sent media history
+@tree.command(
+    name="clearmediahistory",
+    description="Clear the sent media history (Admin only)"
+)
+async def clearmediahistory(interaction: discord.Interaction):
+    if not interaction.user.id == BOT_OWNER_ID:
+        return await interaction.response.send_message("❌ This command is only available to the bot owner.", ephemeral=True)
+    
+    try:
+        result = sent_media_col.delete_many({})
+        await interaction.response.send_message(f"✅ Cleared {result.deleted_count} entries from media history.")
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Error clearing media history: {e}", ephemeral=True)
+        await send_error_dm(BOT_OWNER_ID, str(e))
 
 # ─── Globals ────────────────────────────────────────────────────────────────────
 GLOBAL_POST_INTERVAL = 30  # default to 30 minutes
@@ -196,21 +356,48 @@ def get_config(channel_id: int):
     return config_col.find_one({"channel_id": channel_id}) or {}
 
 async def build_embed(post):
-    embed = discord.Embed(
-        title=post.title[:256],
-        url=f"https://reddit.com{post.permalink}",
-        description=f"👍 {post.score} | 💬 {post.num_comments}",
-        timestamp=datetime.utcfromtimestamp(post.created_utc),
-        color=discord.Color.red()
-    )
-    if "v.redd.it" in post.url and post.media:
-        video_url = post.media.get("reddit_video", {}).get("fallback_url")
-        if video_url:
-            embed.add_field(name="Video", value=video_url, inline=False)
-    elif post.url:
-        embed.set_image(url=post.url)
-    embed.set_footer(text=f"Posted by u/{post.author}")
-    return embed
+    """Build a rich embed for the post with enhanced media support."""
+    try:
+        embed = discord.Embed(
+            title=post.title[:256],
+            url=f"https://reddit.com{post.permalink}",
+            description=f"👍 {post.score} | 💬 {post.num_comments}",
+            timestamp=datetime.utcfromtimestamp(post.created_utc),
+            color=discord.Color.red()
+        )
+        
+        # Handle different types of media
+        if "v.redd.it" in post.url and post.media:
+            video_url = post.media.get("reddit_video", {}).get("fallback_url")
+            if video_url:
+                embed.add_field(name="Video", value=video_url, inline=False)
+                # Add thumbnail if available
+                if hasattr(post, 'thumbnail') and post.thumbnail != 'default':
+                    embed.set_thumbnail(url=post.thumbnail)
+        
+        elif "redgifs.com" in post.url or "gfycat.com" in post.url:
+            embed.add_field(name="GIF", value=post.url, inline=False)
+            if hasattr(post, 'thumbnail') and post.thumbnail != 'default':
+                embed.set_thumbnail(url=post.thumbnail)
+        
+        elif "imgur.com" in post.url:
+            # Convert imgur links to direct images if possible
+            if not post.url.endswith((".jpg", ".png", ".gif", ".jpeg")):
+                if "/a/" not in post.url:  # Not an album
+                    image_url = post.url + ".jpg"
+                    embed.set_image(url=image_url)
+            else:
+                embed.set_image(url=post.url)
+        
+        elif post.url:  # Direct image links
+            embed.set_image(url=post.url)
+        
+        embed.set_footer(text=f"Posted by u/{post.author} in r/{post.subreddit}")
+        return embed
+        
+    except Exception as e:
+        print(f"Error building embed: {e}")
+        return None
 
 # ─── Commands ───────────────────────────────────────────────────────────────────
 @tree.command(
@@ -476,15 +663,56 @@ async def auto_post_loop():
                 if embed:
                     await channel.send(embed=embed)
                     LAST_SENT[channel_id] = datetime.now(UTC)
+                    await save_last_sent()
+                    await update_channel_stats(channel_id, post.url, str(post.subreddit))
         except Exception as e:
             print(f"Error in auto_post_loop: {e}")
             continue
+
+# Add stats command
+@tree.command(
+    name="channelstats",
+    description="Show posting statistics for this channel"
+)
+async def channelstats(interaction: discord.Interaction):
+    try:
+        stats = stats_col.find_one({"type": "channel_stats", "channel_id": interaction.channel_id})
+        if not stats:
+            return await interaction.response.send_message("No statistics available for this channel yet.")
+            
+        total_posts = stats.get("total_posts", 0)
+        sub_counts = stats.get("subreddit_counts", {})
+        last_post_time = stats.get("last_post_time")
+        
+        # Build stats message
+        msg = [
+            "📊 **Channel Statistics**",
+            f"Total posts: {total_posts}",
+            "\nPosts by subreddit:"
+        ]
+        
+        for sub, count in sorted(sub_counts.items(), key=lambda x: x[1], reverse=True):
+            percentage = (count / total_posts) * 100
+            msg.append(f"- r/{sub}: {count} ({percentage:.1f}%)")
+            
+        if last_post_time:
+            msg.append(f"\nLast post: {last_post_time.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+            
+        await interaction.response.send_message("\n".join(msg))
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Error fetching statistics: {e}", ephemeral=True)
+        await send_error_dm(BOT_OWNER_ID, str(e))
 
 # ─── Bot Events ─────────────────────────────────────────────────────────────────
 @bot.event
 async def on_ready():
     try:
         print(f"Bot starting up as {bot.user.name}")
+        
+        # Initialize MongoDB
+        if not await init_mongodb():
+            print("WARNING: MongoDB initialization failed!")
+            return
         
         # Setup Reddit client
         await setup_reddit()
@@ -499,12 +727,14 @@ async def on_ready():
         # Then sync to specific guild
         await tree.sync(guild=discord.Object(id=GUILD_ID))
         auto_post_loop.start()
+        
         logging_channel = bot.get_channel(LOGGING_CHANNEL_ID)
         if logging_channel:
             status = "✅" if auth_success else "⚠️"
             await logging_channel.send(
                 f"{status} Bot restarted at {datetime.now(UTC)}\n"
-                f"Reddit auth test: {'Success' if auth_success else 'Failed'}"
+                f"Reddit auth test: {'Success' if auth_success else 'Failed'}\n"
+                f"MongoDB status: {'Initialized' if await init_mongodb() else 'Failed'}"
             )
         print("Bot is ready!")
     except Exception as e:
