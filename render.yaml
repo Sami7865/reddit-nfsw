@@ -10,5 +10,14 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.13.0
+      - key: PYTHONUNBUFFERED
+        value: "true"
     healthCheckPath: /
     healthCheckTimeout: 100
+    scaling:
+      minInstances: 1
+      maxInstances: 1
+    disk:
+      name: tmp
+      mountPath: /tmp
+      sizeGB: 1
