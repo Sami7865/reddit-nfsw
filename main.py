@@ -100,14 +100,15 @@ def get_config(channel_id: int):
 
 async def fetch_post(subreddit: str):
     try:
-        sub = await reddit.subreddit(subreddit, fetch=True)
-        async for post in sub.hot(limit=25):
-            if not post.over_18 or post.stickied:
-                continue
-            if post.url.endswith((".jpg", ".png", ".gif", ".jpeg", ".webm", ".mp4")) or "v.redd.it" in post.url:
-                return post
+        async with reddit.subreddit(subreddit) as sub:
+            async for post in sub.hot(limit=25):
+                if not post.over_18 or post.stickied:
+                    continue
+                if post.url.endswith((".jpg", ".png", ".gif", ".jpeg", ".webm", ".mp4")) or "v.redd.it" in post.url:
+                    return post
         return None
     except Exception as e:
+        print(f"Error fetching post from r/{subreddit}: {e}")
         return None
 
 async def build_embed(post):
@@ -142,9 +143,9 @@ async def addsub(interaction: discord.Interaction, name: str):
     
     try:
         # Check subreddit first before deferring
-        sub = await reddit.subreddit(name, fetch=True)
-        if not sub.over18:
-            return await interaction.response.send_message("❌ Subreddit is not NSFW.", ephemeral=True)
+        async with reddit.subreddit(name) as sub:
+            if not sub.over18:
+                return await interaction.response.send_message("❌ Subreddit is not NSFW.", ephemeral=True)
             
         await interaction.response.defer(thinking=True)
         
