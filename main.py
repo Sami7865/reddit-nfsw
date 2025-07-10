@@ -102,8 +102,10 @@ def get_config(channel_id: int):
 async def fetch_post(subreddit: str):
     try:
         sub = await reddit.subreddit(subreddit)
-        await sub.load()  # Load subreddit data first
-        if not sub.over18:
+        # Get subreddit info to check NSFW status
+        subreddit_info = await sub.subreddit_type()
+        if subreddit_info != "nsfw":
+            print(f"Subreddit r/{subreddit} is not NSFW")
             return None
             
         posts = []
@@ -152,10 +154,14 @@ async def addsub(interaction: discord.Interaction, name: str):
     try:
         # Check subreddit
         sub = await reddit.subreddit(name)
-        await sub.load()  # Load subreddit data first
         
-        if not sub.over18:
-            return await interaction.followup.send("❌ Subreddit is not NSFW.", ephemeral=True)
+        try:
+            # Get subreddit info to check NSFW status
+            subreddit_info = await sub.subreddit_type()
+            if subreddit_info != "nsfw":
+                return await interaction.followup.send("❌ Subreddit is not NSFW.", ephemeral=True)
+        except Exception as e:
+            return await interaction.followup.send("❌ Could not verify subreddit. It might be private or banned.", ephemeral=True)
             
         # Test fetch a post to verify we can access it
         test_post = await fetch_post(name)
