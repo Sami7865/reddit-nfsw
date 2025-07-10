@@ -1,3 +1,14 @@
-buildCommand: |
-  pip install --upgrade pip setuptools wheel
-  pip install -r requirements.txt
+services:
+  - type: worker
+    name: reddit-nsfw-bot
+    env: python
+    region: ohio
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    plan: free
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.13.0
+    healthCheckPath: /
+    healthCheckTimeout: 100
