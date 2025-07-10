@@ -1,0 +1,5 @@
+# requirements.txt for discord.py NSFW Reddit bot (no voice, no py-cord)
+discord.py==2.3.2
+asyncpraw==7.7.1
+pymongo==4.7.2
+Flask==3.0.3
