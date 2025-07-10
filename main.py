@@ -82,7 +82,7 @@ reddit = asyncpraw.Reddit(
     password=REDDIT_PASSWORD,
     user_agent="Discord NSFW Bot by u/Efficient-Life-554",
     check_for_async=False,
-    requestor_kwargs={"timeout": 30}  # Set a default timeout of 30 seconds
+    requestor_kwargs={"timeout": 30}
 )
 
 # Set Reddit client options
@@ -92,62 +92,64 @@ reddit.read_only = False
 async def verify_subreddit_access(sub_name: str):
     """Verify if we can access a subreddit and log detailed error info."""
     try:
-        # First try to get the subreddit instance
-        sub = await reddit.subreddit(sub_name)
-        
-        # Try to get new posts to verify access
+        # Create a task for subreddit access
+        async def access_subreddit():
+            sub = await reddit.subreddit(sub_name)
+            posts = []
+            async for post in sub.new(limit=1):
+                posts.append(post)
+            return len(posts) > 0
+
+        # Run the task with timeout
         try:
-            # Use asyncio.wait_for to handle timeouts properly
-            async def check_posts():
-                async for post in sub.new(limit=1):
-                    print(f"Successfully accessed posts in r/{sub_name}")
-                    return True
-                return False
-                
-            result = await asyncio.wait_for(check_posts(), timeout=30.0)
+            task = asyncio.create_task(access_subreddit())
+            result = await asyncio.wait_for(task, timeout=30.0)
             if result:
+                print(f"Successfully accessed r/{sub_name}")
                 return True, None
             else:
+                print(f"No posts found in r/{sub_name}")
                 return False, "No posts found in subreddit"
-                
         except asyncio.TimeoutError:
-            print(f"Timeout while accessing posts in r/{sub_name}")
-            return False, "Request timed out. Please try again."
+            print(f"Timeout accessing r/{sub_name}")
+            return False, "Request timed out - try again"
         except Exception as e:
-            print(f"Error accessing posts in r/{sub_name}: {e}")
+            print(f"Error accessing posts: {e}")
             return False, f"Error accessing posts: {str(e)}"
 
     except Exception as e:
-        print(f"Error verifying access to r/{sub_name}: {e}")
+        print(f"Error in verify_subreddit_access: {e}")
         return False, f"Error verifying access: {str(e)}"
 
 async def fetch_post(subreddit: str):
     try:
-        sub = await reddit.subreddit(subreddit)
-        
-        # Try to get posts with proper timeout handling
+        # Create a task for fetching posts
+        async def get_posts():
+            sub = await reddit.subreddit(subreddit)
+            async for post in sub.hot(limit=25):
+                if post.stickied:
+                    continue
+                if post.url.endswith((".jpg", ".png", ".gif", ".jpeg", ".webm", ".mp4")) or "v.redd.it" in post.url:
+                    return post
+            return None
+
+        # Run the task with timeout
         try:
-            async def get_media_post():
-                async for post in sub.hot(limit=25):
-                    if post.stickied:
-                        continue
-                    if post.url.endswith((".jpg", ".png", ".gif", ".jpeg", ".webm", ".mp4")) or "v.redd.it" in post.url:
-                        return post
-                return None
-                
-            post = await asyncio.wait_for(get_media_post(), timeout=30.0)
-            if post is None:
-                print(f"No suitable media posts found in r/{subreddit}")
-            return post
-            
+            task = asyncio.create_task(get_posts())
+            post = await asyncio.wait_for(task, timeout=30.0)
+            if post:
+                return post
+            print(f"No media posts found in r/{subreddit}")
+            return None
         except asyncio.TimeoutError:
-            print(f"Timeout while fetching posts from r/{subreddit}")
+            print(f"Timeout fetching posts from r/{subreddit}")
             return None
         except Exception as e:
-            print(f"Error fetching posts from r/{subreddit}: {e}")
+            print(f"Error fetching posts: {e}")
             return None
+
     except Exception as e:
-        print(f"Error accessing subreddit r/{subreddit}: {e}")
+        print(f"Error in fetch_post: {e}")
         return None
 
 # ─── Globals ────────────────────────────────────────────────────────────────────
@@ -211,11 +213,13 @@ async def addsub(interaction: discord.Interaction, name: str):
         if not can_access:
             print(f"Failed to verify access to r/{name}: {error_msg}")
             return await interaction.followup.send(
-                f"❌ Could not access r/{name}. Error: {error_msg}\n"
-                "Make sure:\n"
-                "1. The subreddit name is correct\n"
-                "2. The subreddit exists and is not private\n"
-                "3. The bot's Reddit account is over 18 and can access NSFW content",
+                f"❌ Could not access r/{name}.\n"
+                f"Error: {error_msg}\n"
+                "Please check:\n"
+                "1. The subreddit name is spelled correctly\n"
+                "2. The subreddit exists and is public\n"
+                "3. The bot's Reddit account is properly configured for NSFW content\n"
+                "4. Try again in a few moments if it was a timeout",
                 ephemeral=True
             )
             
@@ -243,7 +247,8 @@ async def addsub(interaction: discord.Interaction, name: str):
     except Exception as e:
         print(f"Error in addsub command for r/{name}: {e}")
         await interaction.followup.send(
-            f"❌ An unexpected error occurred while adding r/{name}: {str(e)}\n"
+            f"❌ An unexpected error occurred while adding r/{name}.\n"
+            f"Error: {str(e)}\n"
             "Please try again or contact the bot owner if the issue persists.",
             ephemeral=True
         )
