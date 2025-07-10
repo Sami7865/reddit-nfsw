@@ -88,6 +88,54 @@ reddit = asyncpraw.Reddit(
 reddit.config.custom_multireddit_fetch = True
 reddit.read_only = False
 
+async def verify_subreddit_access(sub_name: str):
+    """Verify if we can access a subreddit and log detailed error info."""
+    try:
+        # First try to get the subreddit instance
+        sub = await reddit.subreddit(sub_name)
+        
+        # Try to access basic subreddit info
+        try:
+            await sub.load()
+            print(f"Successfully loaded subreddit r/{sub_name}")
+        except Exception as e:
+            print(f"Error loading subreddit r/{sub_name}: {e}")
+            return False, f"Error loading subreddit: {str(e)}"
+
+        # Try to get new posts to verify access
+        try:
+            async for post in sub.new(limit=1):
+                print(f"Successfully accessed posts in r/{sub_name}")
+                return True, None
+        except Exception as e:
+            print(f"Error accessing posts in r/{sub_name}: {e}")
+            return False, f"Error accessing posts: {str(e)}"
+
+    except Exception as e:
+        print(f"Error verifying access to r/{sub_name}: {e}")
+        return False, f"Error verifying access: {str(e)}"
+
+async def fetch_post(subreddit: str):
+    try:
+        sub = await reddit.subreddit(subreddit)
+        
+        # Try to get posts
+        posts = []
+        try:
+            async for post in sub.hot(limit=25):
+                if post.stickied:
+                    continue
+                if post.url.endswith((".jpg", ".png", ".gif", ".jpeg", ".webm", ".mp4")) or "v.redd.it" in post.url:
+                    return post
+            print(f"No suitable media posts found in r/{subreddit}")
+            return None
+        except Exception as e:
+            print(f"Error fetching posts from r/{subreddit}: {e}")
+            return None
+    except Exception as e:
+        print(f"Error accessing subreddit r/{subreddit}: {e}")
+        return None
+
 # ─── Globals ────────────────────────────────────────────────────────────────────
 GLOBAL_POST_INTERVAL = 30  # default to 30 minutes
 LAST_SENT = {}
@@ -103,30 +151,6 @@ def is_admin_or_mod(interaction: discord.Interaction):
 
 def get_config(channel_id: int):
     return config_col.find_one({"channel_id": channel_id}) or {}
-
-async def fetch_post(subreddit: str):
-    try:
-        sub = await reddit.subreddit(subreddit)
-        
-        # First try to get basic info
-        try:
-            async for post in sub.hot(limit=1):
-                # If we can get a post, the subreddit exists and we can access it
-                break
-        except Exception as e:
-            print(f"Cannot access r/{subreddit}: {e}")
-            return None
-            
-        posts = []
-        async for post in sub.hot(limit=25):
-            if post.stickied:
-                continue
-            if post.url.endswith((".jpg", ".png", ".gif", ".jpeg", ".webm", ".mp4")) or "v.redd.it" in post.url:
-                return post
-        return None
-    except Exception as e:
-        print(f"Error fetching post from r/{subreddit}: {e}")
-        return None
 
 async def build_embed(post):
     embed = discord.Embed(
@@ -161,36 +185,55 @@ async def addsub(interaction: discord.Interaction, name: str):
     await interaction.response.defer(thinking=True)
     
     try:
-        # Check if we can access the subreddit first
-        sub = await reddit.subreddit(name)
-        
-        try:
-            # Try to get a post to verify access
-            async for post in sub.hot(limit=1):
-                # We got a post, so we can access the subreddit
-                break
-        except Exception as e:
-            print(f"Error accessing r/{name}: {e}")
-            return await interaction.followup.send("❌ Could not access this subreddit. Make sure it exists and is not private.", ephemeral=True)
+        # Clean up subreddit name
+        name = name.strip().lower()
+        if name.startswith('r/'):
+            name = name[2:]
             
-        # Test fetch a post to verify we can get media content
+        print(f"Attempting to add subreddit: r/{name}")
+        
+        # First verify we can access the subreddit
+        can_access, error_msg = await verify_subreddit_access(name)
+        if not can_access:
+            print(f"Failed to verify access to r/{name}: {error_msg}")
+            return await interaction.followup.send(
+                f"❌ Could not access r/{name}. Error: {error_msg}\n"
+                "Make sure:\n"
+                "1. The subreddit name is correct\n"
+                "2. The subreddit exists and is not private\n"
+                "3. The bot's Reddit account is over 18 and can access NSFW content",
+                ephemeral=True
+            )
+            
+        # Try to fetch a post to verify we can get media content
         test_post = await fetch_post(name)
         if test_post is None:
-            return await interaction.followup.send("❌ Could not find any media posts in this subreddit.", ephemeral=True)
+            return await interaction.followup.send(
+                f"❌ Could not find any media posts in r/{name}.\n"
+                "Make sure the subreddit contains images or videos.",
+                ephemeral=True
+            )
             
+        # Add to database
         config_col.update_one(
             {"channel_id": interaction.channel_id},
-            {"$addToSet": {"subs": name.lower()}, "$setOnInsert": {
+            {"$addToSet": {"subs": name}, "$setOnInsert": {
                 "interval": GLOBAL_POST_INTERVAL,
                 "limit": 25
             }},
             upsert=True
         )
-        await interaction.followup.send(f"✅ Added r/{name} to this channel.")
+        
+        await interaction.followup.send(f"✅ Successfully added r/{name} to this channel!")
+        
     except Exception as e:
-        print(f"Error in addsub: {e}")
-        await interaction.followup.send(f"❌ Failed to add r/{name}: {str(e)}", ephemeral=True)
-        await send_error_dm(BOT_OWNER_ID, str(e))
+        print(f"Error in addsub command for r/{name}: {e}")
+        await interaction.followup.send(
+            f"❌ An unexpected error occurred while adding r/{name}: {str(e)}\n"
+            "Please try again or contact the bot owner if the issue persists.",
+            ephemeral=True
+        )
+        await send_error_dm(BOT_OWNER_ID, f"Error in addsub for r/{name}: {str(e)}")
 
 @tree.command(
     name="removesub",
