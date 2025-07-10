@@ -81,7 +81,8 @@ reddit = asyncpraw.Reddit(
     username=REDDIT_USERNAME,
     password=REDDIT_PASSWORD,
     user_agent="Discord NSFW Bot by u/Efficient-Life-554",
-    check_for_async=False
+    check_for_async=False,
+    requestor_kwargs={"timeout": 30}  # Set a default timeout of 30 seconds
 )
 
 # Set Reddit client options
@@ -94,19 +95,24 @@ async def verify_subreddit_access(sub_name: str):
         # First try to get the subreddit instance
         sub = await reddit.subreddit(sub_name)
         
-        # Try to access basic subreddit info
-        try:
-            await sub.load()
-            print(f"Successfully loaded subreddit r/{sub_name}")
-        except Exception as e:
-            print(f"Error loading subreddit r/{sub_name}: {e}")
-            return False, f"Error loading subreddit: {str(e)}"
-
         # Try to get new posts to verify access
         try:
-            async for post in sub.new(limit=1):
-                print(f"Successfully accessed posts in r/{sub_name}")
+            # Use asyncio.wait_for to handle timeouts properly
+            async def check_posts():
+                async for post in sub.new(limit=1):
+                    print(f"Successfully accessed posts in r/{sub_name}")
+                    return True
+                return False
+                
+            result = await asyncio.wait_for(check_posts(), timeout=30.0)
+            if result:
                 return True, None
+            else:
+                return False, "No posts found in subreddit"
+                
+        except asyncio.TimeoutError:
+            print(f"Timeout while accessing posts in r/{sub_name}")
+            return False, "Request timed out. Please try again."
         except Exception as e:
             print(f"Error accessing posts in r/{sub_name}: {e}")
             return False, f"Error accessing posts: {str(e)}"
@@ -119,15 +125,23 @@ async def fetch_post(subreddit: str):
     try:
         sub = await reddit.subreddit(subreddit)
         
-        # Try to get posts
-        posts = []
+        # Try to get posts with proper timeout handling
         try:
-            async for post in sub.hot(limit=25):
-                if post.stickied:
-                    continue
-                if post.url.endswith((".jpg", ".png", ".gif", ".jpeg", ".webm", ".mp4")) or "v.redd.it" in post.url:
-                    return post
-            print(f"No suitable media posts found in r/{subreddit}")
+            async def get_media_post():
+                async for post in sub.hot(limit=25):
+                    if post.stickied:
+                        continue
+                    if post.url.endswith((".jpg", ".png", ".gif", ".jpeg", ".webm", ".mp4")) or "v.redd.it" in post.url:
+                        return post
+                return None
+                
+            post = await asyncio.wait_for(get_media_post(), timeout=30.0)
+            if post is None:
+                print(f"No suitable media posts found in r/{subreddit}")
+            return post
+            
+        except asyncio.TimeoutError:
+            print(f"Timeout while fetching posts from r/{subreddit}")
             return None
         except Exception as e:
             print(f"Error fetching posts from r/{subreddit}: {e}")
