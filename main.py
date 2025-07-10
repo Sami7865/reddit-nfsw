@@ -248,9 +248,11 @@ async def fetch_post(subreddit: str):
                 time_filters = ['day', 'week', 'month', 'year', 'all']
                 time_filter = time_filters[datetime.now(UTC).minute % len(time_filters)]
                 
+                print(f"Fetching from r/{subreddit} using {listing_type} posts")
+                
                 # Get the appropriate listing
                 if listing_type == 'top':
-                    listing = sub.top(time_filter=time_filter, limit=100)  # Increased limit for more options
+                    listing = sub.top(time_filter=time_filter, limit=100)
                 else:
                     listing = getattr(sub, listing_type)(limit=100)
                 
@@ -258,52 +260,66 @@ async def fetch_post(subreddit: str):
                 seen_urls = set()
                 
                 async for post in listing:
-                    if post.stickied or post.is_self:
-                        continue
+                    try:
+                        if post.stickied or post.is_self:
+                            continue
+                            
+                        # Skip if we've seen this URL before
+                        if post.url in seen_urls:
+                            continue
+                        seen_urls.add(post.url)
                         
-                    # Skip if we've seen this URL before
-                    if post.url in seen_urls:
-                        continue
-                    seen_urls.add(post.url)
-                    
-                    # Skip if this media was sent in the last week
-                    if await is_media_sent(post.url):
-                        continue
-                    
-                    # Check for various media types
-                    is_valid = False
-                    
-                    # Direct image links
-                    if post.url.endswith((".jpg", ".png", ".gif", ".jpeg")):
-                        is_valid = True
-                    
-                    # Reddit-hosted videos
-                    elif "v.redd.it" in post.url and post.media:
-                        if post.media.get("reddit_video", {}).get("fallback_url"):
+                        # Skip if this media was sent in the last week
+                        if await is_media_sent(post.url):
+                            continue
+                        
+                        # Debug print
+                        print(f"Checking post: {post.url}")
+                        
+                        # Check for various media types
+                        is_valid = False
+                        
+                        # Direct image links
+                        if any(post.url.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".gif"]):
+                            print(f"Found direct image: {post.url}")
                             is_valid = True
-                    
-                    # Redgifs links
-                    elif "redgifs.com" in post.url or "gfycat.com" in post.url:
-                        is_valid = True
-                    
-                    # Imgur links
-                    elif "imgur.com" in post.url:
-                        is_valid = True
                         
-                    if is_valid:
-                        valid_posts.append(post)
+                        # Reddit-hosted videos
+                        elif "v.redd.it" in post.url:
+                            if hasattr(post, 'media') and post.media and post.media.get("reddit_video"):
+                                print(f"Found Reddit video: {post.url}")
+                                is_valid = True
                         
-                        # If we have enough posts, randomly select one
-                        if len(valid_posts) >= 25:
-                            selected_post = valid_posts[datetime.now(UTC).microsecond % len(valid_posts)]
-                            await mark_media_sent(selected_post.url, selected_post.id, str(selected_post.subreddit))
-                            return selected_post
+                        # Redgifs links
+                        elif any(domain in post.url.lower() for domain in ["redgifs.com", "gfycat.com"]):
+                            print(f"Found Redgifs/Gfycat: {post.url}")
+                            is_valid = True
+                        
+                        # Imgur links
+                        elif "imgur.com" in post.url.lower():
+                            print(f"Found Imgur: {post.url}")
+                            is_valid = True
+                            
+                        if is_valid:
+                            valid_posts.append(post)
+                            print(f"Added valid post: {post.url}")
+                            
+                            # If we have enough posts, randomly select one
+                            if len(valid_posts) >= 25:
+                                selected_post = valid_posts[datetime.now(UTC).microsecond % len(valid_posts)]
+                                await mark_media_sent(selected_post.url, selected_post.id, str(selected_post.subreddit))
+                                return selected_post
+                    except Exception as post_error:
+                        print(f"Error processing post: {post_error}")
+                        continue
                 
                 # If we have any valid posts, randomly select one
                 if valid_posts:
                     selected_post = valid_posts[datetime.now(UTC).microsecond % len(valid_posts)]
                     await mark_media_sent(selected_post.url, selected_post.id, str(selected_post.subreddit))
                     return selected_post
+                    
+                print(f"No valid posts found in r/{subreddit} (checked {len(seen_urls)} posts)")
                 return None
 
         # Create and run task with timeout
@@ -367,7 +383,7 @@ async def build_embed(post):
         )
         
         # Handle different types of media
-        if "v.redd.it" in post.url and post.media:
+        if "v.redd.it" in post.url and hasattr(post, 'media') and post.media:
             video_url = post.media.get("reddit_video", {}).get("fallback_url")
             if video_url:
                 embed.add_field(name="Video", value=video_url, inline=False)
@@ -382,7 +398,7 @@ async def build_embed(post):
         
         elif "imgur.com" in post.url:
             # Convert imgur links to direct images if possible
-            if not post.url.endswith((".jpg", ".png", ".gif", ".jpeg")):
+            if not any(post.url.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".gif"]):
                 if "/a/" not in post.url:  # Not an album
                     image_url = post.url + ".jpg"
                     embed.set_image(url=image_url)
@@ -721,11 +737,22 @@ async def on_ready():
         auth_success = await test_reddit_auth()
         if not auth_success:
             print("WARNING: Reddit authentication test failed!")
+        
+        try:
+            print("Syncing commands...")
+            # First sync globally
+            await tree.sync()
+            print("Global commands synced")
             
-        # Sync commands globally first
-        await tree.sync()
-        # Then sync to specific guild
-        await tree.sync(guild=discord.Object(id=GUILD_ID))
+            # Then sync to specific guild for instant updates
+            guild = discord.Object(id=GUILD_ID)
+            tree.copy_global_to(guild=guild)
+            await tree.sync(guild=guild)
+            print("Guild commands synced")
+        except Exception as sync_error:
+            print(f"Error syncing commands: {sync_error}")
+        
+        # Start auto posting
         auto_post_loop.start()
         
         logging_channel = bot.get_channel(LOGGING_CHANNEL_ID)
