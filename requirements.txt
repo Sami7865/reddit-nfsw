@@ -8,3 +8,6 @@ requests==2.31.0
 python-dotenv==1.0.1
 dnspython==2.6.1  # Required for pymongo srv URLs
 gunicorn==21.2.0  # For production web server
+aiofiles==23.2.1  # For async file operations
+colorlog==6.8.2   # For better logging
+APScheduler==3.10.4  # For better task scheduling
