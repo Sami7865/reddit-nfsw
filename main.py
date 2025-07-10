@@ -1,3 +1,4 @@
+
 import sys
 
 # Monkey-patch to fake audioop for discord.py on Python 3.13+
@@ -214,8 +215,16 @@ async def setup_reddit():
     
     # Enable NSFW content
     reddit.config.custom_config = {"over_18": True}
+    reddit.config.custom_config["nsfw"] = True
     
-    print("Reddit client initialized")
+    # Verify the account is configured for NSFW content
+    me = await reddit.user.me()
+    print("\nReddit account configuration:")
+    print(f"- Username: {me.name}")
+    print(f"- Over 18: {getattr(me, 'over_18', 'unknown')}")
+    print(f"- NSFW allowed: {getattr(me, 'nsfw_allowed', 'unknown')}")
+    
+    print("Reddit client initialized with NSFW access enabled")
 
 @asynccontextmanager
 async def get_subreddit(name: str):
@@ -224,9 +233,10 @@ async def get_subreddit(name: str):
         await setup_reddit()
     try:
         sub = await reddit.subreddit(name)
-        # Explicitly check and enable NSFW access
+        # Force NSFW access
         sub._fetched = True
         sub.over18 = True
+        sub.nsfw = True
         yield sub
     except Exception as e:
         print(f"Error accessing subreddit r/{name}: {e}")
@@ -241,24 +251,33 @@ async def verify_subreddit_access(sub_name: str):
             async with get_subreddit(sub_name) as sub:
                 # First verify we can access the subreddit
                 subreddit_info = await sub.load()
-                print(f"Subreddit info - Over 18: {subreddit_info.over18}, Subscribers: {subreddit_info.subscribers}")
+                print(f"Subreddit info:")
+                print(f"- Over 18: {getattr(subreddit_info, 'over18', 'unknown')}")
+                print(f"- NSFW: {getattr(subreddit_info, 'nsfw', 'unknown')}")
+                print(f"- Subscribers: {getattr(subreddit_info, 'subscribers', 0)}")
+                print(f"- Description: {getattr(subreddit_info, 'description', '')[:100]}...")
                 
                 # Try to get a post to verify content access
-                async for post in sub.new(limit=1):
-                    print(f"Successfully accessed post: {post.url}")
-                    return True
-            return False
+                posts_found = False
+                async for post in sub.new(limit=5):
+                    posts_found = True
+                    print(f"Test post found: {post.url}")
+                    print(f"- Is video: {getattr(post, 'is_video', False)}")
+                    print(f"- Post hint: {getattr(post, 'post_hint', 'unknown')}")
+                    print(f"- Has media: {bool(getattr(post, 'media', None))}")
+                    break
+                
+                if posts_found:
+                    print(f"Successfully accessed r/{sub_name}")
+                    return True, None
+                else:
+                    print(f"No posts found in r/{sub_name}")
+                    return False, "Subreddit exists but has no posts"
             
         # Create and run task with timeout
         task = asyncio.create_task(_verify())
         result = await asyncio.wait_for(task, timeout=30.0)
-        
-        if result:
-            print(f"Successfully accessed r/{sub_name}")
-            return True, None
-        else:
-            print(f"No posts found in r/{sub_name}")
-            return False, "Subreddit exists but has no posts"
+        return result
             
     except asyncio.TimeoutError:
         print(f"Timeout accessing r/{sub_name}")
@@ -274,35 +293,32 @@ async def fetch_post(subreddit: str):
             async with get_subreddit(subreddit) as sub:
                 # Verify NSFW access
                 subreddit_info = await sub.load()
-                if not subreddit_info.over18:
-                    print(f"Warning: r/{subreddit} is not marked as NSFW")
+                print(f"\nFetching from r/{subreddit}")
+                print(f"Subreddit info - Over 18: {subreddit_info.over18}, Subscribers: {subreddit_info.subscribers}")
                 
                 # Randomly choose a listing type
-                listing_types = ['hot', 'new', 'top', 'rising']
+                listing_types = ['hot', 'new']  # Removed top and rising as they can be unreliable
                 listing_type = listing_types[datetime.now(UTC).second % len(listing_types)]
                 
-                # For top posts, randomly choose a time filter
-                time_filters = ['day', 'week', 'month', 'year', 'all']
-                time_filter = time_filters[datetime.now(UTC).minute % len(time_filters)]
-                
-                print(f"Fetching from r/{subreddit} using {listing_type} posts")
+                print(f"Using {listing_type} listing")
                 
                 # Get the appropriate listing
-                if listing_type == 'top':
-                    listing = sub.top(time_filter=time_filter, limit=100)
-                else:
-                    listing = getattr(sub, listing_type)(limit=100)
+                listing = getattr(sub, listing_type)(limit=50)  # Reduced limit for faster response
                 
                 valid_posts = []
                 seen_urls = set()
+                processed_count = 0
                 
                 async for post in listing:
+                    processed_count += 1
                     try:
                         if post.stickied or post.is_self:
+                            print(f"Skipping {'stickied' if post.stickied else 'self'} post")
                             continue
                             
                         # Skip if we've seen this URL before
                         if post.url in seen_urls:
+                            print(f"Skipping duplicate URL: {post.url}")
                             continue
                         seen_urls.add(post.url)
                         
@@ -311,45 +327,55 @@ async def fetch_post(subreddit: str):
                             print(f"Skipping previously sent: {post.url}")
                             continue
                         
-                        # Debug print
-                        print(f"Checking post: {post.url}")
+                        print(f"\nChecking post: {post.url}")
+                        print(f"Post type hints - is_video: {getattr(post, 'is_video', False)}, post_hint: {getattr(post, 'post_hint', 'unknown')}")
                         
                         # Check for various media types
                         is_valid = False
+                        media_type = "unknown"
                         
                         # Direct image links
                         if any(post.url.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".gif"]):
                             print(f"Found direct image: {post.url}")
                             is_valid = True
+                            media_type = "direct_image"
                         
                         # Reddit-hosted videos
                         elif "v.redd.it" in post.url:
                             if hasattr(post, 'media') and post.media and post.media.get("reddit_video"):
                                 print(f"Found Reddit video: {post.url}")
+                                print(f"Video details: {post.media['reddit_video']}")
                                 is_valid = True
+                                media_type = "reddit_video"
                         
                         # Redgifs links
                         elif any(domain in post.url.lower() for domain in ["redgifs.com", "gfycat.com"]):
                             print(f"Found Redgifs/Gfycat: {post.url}")
                             is_valid = True
+                            media_type = "redgifs"
                         
                         # Imgur links
                         elif "imgur.com" in post.url.lower():
                             print(f"Found Imgur: {post.url}")
                             is_valid = True
+                            media_type = "imgur"
                             
                         if is_valid:
+                            print(f"✅ Valid {media_type} post found: {post.url}")
                             valid_posts.append(post)
-                            print(f"Added valid post: {post.url}")
                             
                             # If we have enough posts, randomly select one
-                            if len(valid_posts) >= 25:
+                            if len(valid_posts) >= 10:  # Reduced threshold for faster response
                                 selected_post = valid_posts[datetime.now(UTC).microsecond % len(valid_posts)]
                                 await mark_media_sent(selected_post.url, selected_post.id, str(selected_post.subreddit))
                                 return selected_post
                     except Exception as post_error:
                         print(f"Error processing post: {post_error}")
                         continue
+                
+                print(f"\nProcessed {processed_count} posts total")
+                print(f"Found {len(valid_posts)} valid media posts")
+                print(f"Skipped {len(seen_urls) - len(valid_posts)} non-media posts")
                 
                 # If we have any valid posts, randomly select one
                 if valid_posts:
@@ -361,11 +387,12 @@ async def fetch_post(subreddit: str):
                 return None
 
         # Create and run task with timeout
+        print(f"\nStarting fetch from r/{subreddit}")
         task = asyncio.create_task(_fetch())
         post = await asyncio.wait_for(task, timeout=30.0)
         
         if post:
-            print(f"Fetched {post.url} from r/{subreddit} ({post.title[:30]}...)")
+            print(f"Successfully fetched post from r/{subreddit}: {post.url}")
             return post
         print(f"No media posts found in r/{subreddit}")
         return None
