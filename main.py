@@ -100,13 +100,22 @@ def get_config(channel_id: int):
     return config_col.find_one({"channel_id": channel_id}) or {}
 
 async def fetch_post(subreddit: str):
-    try:
+    async def _fetch():
         sub = await reddit.subreddit(subreddit)
+        posts = []
         async for post in sub.hot(limit=25):
             if not post.over_18 or post.stickied:
                 continue
             if post.url.endswith((".jpg", ".png", ".gif", ".jpeg", ".webm", ".mp4")) or "v.redd.it" in post.url:
-                return post
+                posts.append(post)
+                if len(posts) >= 1:  # Get at least one post before stopping
+                    break
+        return posts[0] if posts else None
+
+    try:
+        return await asyncio.wait_for(_fetch(), timeout=30.0)  # 30 second timeout
+    except asyncio.TimeoutError:
+        print(f"Timeout while fetching posts from r/{subreddit}")
         return None
     except Exception as e:
         print(f"Error fetching post from r/{subreddit}: {e}")
@@ -146,11 +155,19 @@ async def addsub(interaction: discord.Interaction, name: str):
         await interaction.response.defer(thinking=True)
         
         # Check subreddit
-        sub = await reddit.subreddit(name)
-        await sub.load()  # This ensures the subreddit exists and loads its data
-        
-        if not sub.over18:
-            return await interaction.followup.send("❌ Subreddit is not NSFW.", ephemeral=True)
+        async def check_sub():
+            sub = await reddit.subreddit(name)
+            await sub.load()  # Force a request to check if subreddit exists
+            return await sub.over18
+
+        try:
+            is_nsfw = await asyncio.wait_for(check_sub(), timeout=30.0)  # 30 second timeout
+            if not is_nsfw:
+                return await interaction.followup.send("❌ Subreddit is not NSFW.", ephemeral=True)
+        except asyncio.TimeoutError:
+            return await interaction.followup.send("❌ Timeout while checking subreddit. Please try again.", ephemeral=True)
+        except Exception as e:
+            return await interaction.followup.send(f"❌ Error checking subreddit: {str(e)}", ephemeral=True)
             
         config_col.update_one(
             {"channel_id": interaction.channel_id},
@@ -161,8 +178,6 @@ async def addsub(interaction: discord.Interaction, name: str):
             upsert=True
         )
         await interaction.followup.send(f"✅ Added r/{name} to this channel.")
-    except asyncpraw.exceptions.InvalidURL:
-        await interaction.followup.send(f"❌ Invalid subreddit name: r/{name}", ephemeral=True)
     except Exception as e:
         print(f"Error in addsub: {e}")
         await interaction.followup.send(f"❌ Failed to add r/{name}: {str(e)}", ephemeral=True)
@@ -268,13 +283,20 @@ async def send(interaction: discord.Interaction):
             return await interaction.followup.send("❌ No subreddits linked.")
         
         sub = subs[datetime.now(UTC).second % len(subs)]
-        post = await fetch_post(sub)
-        if not post:
-            return await interaction.followup.send("⚠️ No valid post found.")
-        embed = await build_embed(post)
-        await interaction.followup.send(embed=embed)
+        try:
+            post = await asyncio.wait_for(fetch_post(sub), timeout=30.0)
+            if not post:
+                return await interaction.followup.send("⚠️ No valid post found.")
+            embed = await build_embed(post)
+            if not embed:
+                return await interaction.followup.send("⚠️ Failed to create embed.")
+            await interaction.followup.send(embed=embed)
+        except asyncio.TimeoutError:
+            await interaction.followup.send("❌ Timeout while fetching post. Please try again.", ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"❌ Error fetching post: {str(e)}", ephemeral=True)
     except Exception as e:
-        print(f"Error in send: {e}")
+        print(f"Error in send command: {e}")
         await interaction.followup.send("❌ Error sending post.", ephemeral=True)
         await send_error_dm(BOT_OWNER_ID, str(e))
 
@@ -315,18 +337,23 @@ async def forcesend(interaction: discord.Interaction, count: int = 1):
             for _ in range(count):
                 try:
                     sub = cfg["subs"][datetime.now(UTC).second % len(cfg["subs"])]
-                    post = await fetch_post(sub)
+                    post = await asyncio.wait_for(fetch_post(sub), timeout=30.0)
                     if post:
                         embed = await build_embed(post)
-                        await channel.send(embed=embed)
-                        success_count += 1
-                except Exception:
+                        if embed:
+                            await channel.send(embed=embed)
+                            success_count += 1
+                except asyncio.TimeoutError:
+                    print(f"Timeout while fetching post for forcesend from r/{sub}")
+                    fail_count += 1
+                except Exception as e:
+                    print(f"Error in forcesend for r/{sub}: {e}")
                     fail_count += 1
                     continue
         
         await interaction.followup.send(f"✅ Force send complete!\nSuccess: {success_count}\nFailed: {fail_count}")
     except Exception as e:
-        print(f"Error in forcesend: {e}")
+        print(f"Error in forcesend command: {e}")
         await interaction.followup.send("❌ Error during force send.", ephemeral=True)
         await send_error_dm(BOT_OWNER_ID, str(e))
 
@@ -334,31 +361,45 @@ async def forcesend(interaction: discord.Interaction, count: int = 1):
 @tasks.loop(minutes=1)
 async def auto_post_loop():
     for cfg in config_col.find():
-        channel_id = cfg["channel_id"]
-        interval = cfg.get("interval", GLOBAL_POST_INTERVAL)
-        last_time = LAST_SENT.get(channel_id, datetime.min.replace(tzinfo=UTC))
-        if datetime.now(UTC) - last_time < timedelta(minutes=interval):
-            continue
-        channel = bot.get_channel(channel_id)
-        if not channel:
-            config_col.delete_one({"channel_id": channel_id})
-            continue
-        if not cfg.get("subs"):
-            continue
-        sub = cfg["subs"][datetime.now(UTC).second % len(cfg["subs"])]
-        post = await fetch_post(sub)
-        if post:
-            try:
-                embed = await build_embed(post)
-                await channel.send(embed=embed)
-                LAST_SENT[channel_id] = datetime.now(UTC)
-            except Exception:
+        try:
+            channel_id = cfg["channel_id"]
+            interval = cfg.get("interval", GLOBAL_POST_INTERVAL)
+            last_time = LAST_SENT.get(channel_id, datetime.min.replace(tzinfo=UTC))
+            
+            if datetime.now(UTC) - last_time < timedelta(minutes=interval):
                 continue
+                
+            channel = bot.get_channel(channel_id)
+            if not channel:
+                config_col.delete_one({"channel_id": channel_id})
+                continue
+                
+            if not cfg.get("subs"):
+                continue
+                
+            sub = cfg["subs"][datetime.now(UTC).second % len(cfg["subs"])]
+            try:
+                post = await asyncio.wait_for(fetch_post(sub), timeout=30.0)
+                if post:
+                    embed = await build_embed(post)
+                    if embed:
+                        await channel.send(embed=embed)
+                        LAST_SENT[channel_id] = datetime.now(UTC)
+            except asyncio.TimeoutError:
+                print(f"Timeout while fetching post for auto_post_loop from r/{sub}")
+                continue
+            except Exception as e:
+                print(f"Error in auto_post_loop for r/{sub}: {e}")
+                continue
+        except Exception as e:
+            print(f"Error in auto_post_loop main loop: {e}")
+            continue
 
 # ─── Bot Events ─────────────────────────────────────────────────────────────────
 @bot.event
 async def on_ready():
     try:
+        print(f"Bot starting up as {bot.user.name}")
         # Sync commands globally first
         await tree.sync()
         # Then sync to specific guild
@@ -367,9 +408,10 @@ async def on_ready():
         logging_channel = bot.get_channel(LOGGING_CHANNEL_ID)
         if logging_channel:
             await logging_channel.send(f"✅ Bot restarted at {datetime.now(UTC)}")
+        print("Bot is ready!")
     except Exception as e:
         print(f"Error during startup: {e}")
-        if logging_channel:
+        if 'logging_channel' in locals() and logging_channel:
             await logging_channel.send(f"⚠️ Error during startup: {e}")
 
 @bot.event
