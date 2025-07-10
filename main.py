@@ -1,3 +1,10 @@
+import sys
+
+# Monkey-patch to fake audioop for discord.py on Python 3.13+
+if sys.version_info >= (3, 13):
+    import types
+    sys.modules['audioop'] = types.ModuleType('audioop')
+
 import os
 import asyncio
 import logging
@@ -259,11 +266,4 @@ async def on_command_error(ctx, error):
         await send_error_dm(BOT_OWNER_ID, str(error))
 
 # ─── Run Bot ────────────────────────────────────────────────────────────────────
-import sys
-
-# Monkey-patch to fake audioop for discord.py on Python 3.13+
-if sys.version_info >= (3, 13):
-    import types
-    sys.modules['audioop'] = types.ModuleType('audioop')
-
 bot.run(TOKEN)
