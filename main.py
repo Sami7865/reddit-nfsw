@@ -100,22 +100,14 @@ def get_config(channel_id: int):
     return config_col.find_one({"channel_id": channel_id}) or {}
 
 async def fetch_post(subreddit: str):
-    async def _fetch():
+    try:
         sub = await reddit.subreddit(subreddit)
         posts = []
         async for post in sub.hot(limit=25):
             if not post.over_18 or post.stickied:
                 continue
             if post.url.endswith((".jpg", ".png", ".gif", ".jpeg", ".webm", ".mp4")) or "v.redd.it" in post.url:
-                posts.append(post)
-                if len(posts) >= 1:  # Get at least one post before stopping
-                    break
-        return posts[0] if posts else None
-
-    try:
-        return await asyncio.wait_for(_fetch(), timeout=30.0)  # 30 second timeout
-    except asyncio.TimeoutError:
-        print(f"Timeout while fetching posts from r/{subreddit}")
+                return post
         return None
     except Exception as e:
         print(f"Error fetching post from r/{subreddit}: {e}")
@@ -151,23 +143,15 @@ async def addsub(interaction: discord.Interaction, name: str):
     if not is_admin_or_mod(interaction):
         return await interaction.response.send_message("You must be an admin/mod to use this.", ephemeral=True)
     
+    await interaction.response.defer(thinking=True)
+    
     try:
-        await interaction.response.defer(thinking=True)
-        
         # Check subreddit
-        async def check_sub():
-            sub = await reddit.subreddit(name)
-            await sub.load()  # Force a request to check if subreddit exists
-            return await sub.over18
-
-        try:
-            is_nsfw = await asyncio.wait_for(check_sub(), timeout=30.0)  # 30 second timeout
-            if not is_nsfw:
-                return await interaction.followup.send("❌ Subreddit is not NSFW.", ephemeral=True)
-        except asyncio.TimeoutError:
-            return await interaction.followup.send("❌ Timeout while checking subreddit. Please try again.", ephemeral=True)
-        except Exception as e:
-            return await interaction.followup.send(f"❌ Error checking subreddit: {str(e)}", ephemeral=True)
+        sub = await reddit.subreddit(name)
+        is_nsfw = await sub.over18
+        
+        if not is_nsfw:
+            return await interaction.followup.send("❌ Subreddit is not NSFW.", ephemeral=True)
             
         config_col.update_one(
             {"channel_id": interaction.channel_id},
@@ -274,27 +258,24 @@ async def setglobalinterval(interaction: discord.Interaction, minutes: int):
     description="Manually send a post to this channel."
 )
 async def send(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
+    
     try:
-        await interaction.response.defer(thinking=True)
-        
         cfg = get_config(interaction.channel_id)
         subs = cfg.get("subs", [])
         if not subs:
             return await interaction.followup.send("❌ No subreddits linked.")
         
         sub = subs[datetime.now(UTC).second % len(subs)]
-        try:
-            post = await asyncio.wait_for(fetch_post(sub), timeout=30.0)
-            if not post:
-                return await interaction.followup.send("⚠️ No valid post found.")
-            embed = await build_embed(post)
-            if not embed:
-                return await interaction.followup.send("⚠️ Failed to create embed.")
-            await interaction.followup.send(embed=embed)
-        except asyncio.TimeoutError:
-            await interaction.followup.send("❌ Timeout while fetching post. Please try again.", ephemeral=True)
-        except Exception as e:
-            await interaction.followup.send(f"❌ Error fetching post: {str(e)}", ephemeral=True)
+        post = await fetch_post(sub)
+        if not post:
+            return await interaction.followup.send("⚠️ No valid post found.")
+        
+        embed = await build_embed(post)
+        if not embed:
+            return await interaction.followup.send("⚠️ Failed to create embed.")
+            
+        await interaction.followup.send(embed=embed)
     except Exception as e:
         print(f"Error in send command: {e}")
         await interaction.followup.send("❌ Error sending post.", ephemeral=True)
@@ -316,9 +297,10 @@ async def send(interaction: discord.Interaction):
 async def forcesend(interaction: discord.Interaction, count: int = 1):
     if not is_admin_or_mod(interaction):
         return await interaction.response.send_message("Admin only.", ephemeral=True)
+    
+    await interaction.response.defer(thinking=True)
+    
     try:
-        await interaction.response.defer(thinking=True)
-        
         if not 1 <= count <= 5:
             return await interaction.followup.send("❌ Count must be between 1 and 5.", ephemeral=True)
         
@@ -337,15 +319,12 @@ async def forcesend(interaction: discord.Interaction, count: int = 1):
             for _ in range(count):
                 try:
                     sub = cfg["subs"][datetime.now(UTC).second % len(cfg["subs"])]
-                    post = await asyncio.wait_for(fetch_post(sub), timeout=30.0)
+                    post = await fetch_post(sub)
                     if post:
                         embed = await build_embed(post)
                         if embed:
                             await channel.send(embed=embed)
                             success_count += 1
-                except asyncio.TimeoutError:
-                    print(f"Timeout while fetching post for forcesend from r/{sub}")
-                    fail_count += 1
                 except Exception as e:
                     print(f"Error in forcesend for r/{sub}: {e}")
                     fail_count += 1
@@ -378,21 +357,14 @@ async def auto_post_loop():
                 continue
                 
             sub = cfg["subs"][datetime.now(UTC).second % len(cfg["subs"])]
-            try:
-                post = await asyncio.wait_for(fetch_post(sub), timeout=30.0)
-                if post:
-                    embed = await build_embed(post)
-                    if embed:
-                        await channel.send(embed=embed)
-                        LAST_SENT[channel_id] = datetime.now(UTC)
-            except asyncio.TimeoutError:
-                print(f"Timeout while fetching post for auto_post_loop from r/{sub}")
-                continue
-            except Exception as e:
-                print(f"Error in auto_post_loop for r/{sub}: {e}")
-                continue
+            post = await fetch_post(sub)
+            if post:
+                embed = await build_embed(post)
+                if embed:
+                    await channel.send(embed=embed)
+                    LAST_SENT[channel_id] = datetime.now(UTC)
         except Exception as e:
-            print(f"Error in auto_post_loop main loop: {e}")
+            print(f"Error in auto_post_loop: {e}")
             continue
 
 # ─── Bot Events ─────────────────────────────────────────────────────────────────
