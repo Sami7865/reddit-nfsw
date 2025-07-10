@@ -129,8 +129,13 @@ async def build_embed(post):
 
 # ─── Commands ───────────────────────────────────────────────────────────────────
 
-@tree.command(name="addsub", description="Link a subreddit to this channel.")
-@app_commands.describe(name="Subreddit name")
+@tree.command(
+    name="addsub",
+    description="Link a subreddit to this channel."
+)
+@app_commands.describe(
+    name="Subreddit name (without r/)"
+)
 async def addsub(interaction: discord.Interaction, name: str):
     if not is_admin_or_mod(interaction):
         return await interaction.response.send_message("You must be an admin/mod to use this.", ephemeral=True)
@@ -154,75 +159,162 @@ async def addsub(interaction: discord.Interaction, name: str):
         await interaction.followup.send(f"❌ Failed to add r/{name}: {e}")
         await send_error_dm(BOT_OWNER_ID, str(e))
 
-@tree.command(name="removesub", description="Unlink a subreddit from this channel.")
-@app_commands.describe(name="Subreddit name")
+@tree.command(
+    name="removesub",
+    description="Unlink a subreddit from this channel."
+)
+@app_commands.describe(
+    name="Subreddit name (without r/)"
+)
 async def removesub(interaction: discord.Interaction, name: str):
     if not is_admin_or_mod(interaction):
         return await interaction.response.send_message("You must be an admin/mod to use this.", ephemeral=True)
-    config_col.update_one({"channel_id": interaction.channel_id}, {"$pull": {"subs": name.lower()}})
-    await interaction.response.send_message(f"🗑️ Removed r/{name} from this channel.")
+    try:
+        config_col.update_one({"channel_id": interaction.channel_id}, {"$pull": {"subs": name.lower()}})
+        await interaction.response.send_message(f"🗑️ Removed r/{name} from this channel.")
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Error removing subreddit: {e}", ephemeral=True)
+        await send_error_dm(BOT_OWNER_ID, str(e))
 
-@tree.command(name="listsubs", description="List all subreddits linked to this channel.")
+@tree.command(
+    name="listsubs",
+    description="List all subreddits linked to this channel."
+)
 async def listsubs(interaction: discord.Interaction):
-    cfg = get_config(interaction.channel_id)
-    subs = cfg.get("subs", [])
-    if not subs:
-        return await interaction.response.send_message("❌ No subreddits linked.")
-    await interaction.response.send_message("📜 Subreddits:\n" + "\n".join(f"- r/{s}" for s in subs))
+    try:
+        cfg = get_config(interaction.channel_id)
+        subs = cfg.get("subs", [])
+        if not subs:
+            return await interaction.response.send_message("❌ No subreddits linked.")
+        await interaction.response.send_message("📜 Subreddits:\n" + "\n".join(f"- r/{s}" for s in subs))
+    except Exception as e:
+        await interaction.response.send_message("❌ Error listing subreddits.", ephemeral=True)
+        await send_error_dm(BOT_OWNER_ID, str(e))
 
-@tree.command(name="setinterval", description="Set post interval (minutes) for this channel.")
-@app_commands.describe(minutes="Minutes between posts")
+@tree.command(
+    name="setinterval",
+    description="Set post interval (minutes) for this channel."
+)
+@app_commands.describe(
+    minutes="Minutes between posts (1-1440)"
+)
+@app_commands.choices(
+    minutes=[
+        app_commands.Choice(name=f"{i} minutes", value=i)
+        for i in [1, 5, 10, 15, 30, 60, 120, 180, 240, 360, 480, 720, 1440]
+    ]
+)
 async def setinterval(interaction: discord.Interaction, minutes: int):
     if not is_admin_or_mod(interaction):
         return await interaction.response.send_message("Admin only.", ephemeral=True)
-    config_col.update_one({"channel_id": interaction.channel_id}, {"$set": {"interval": minutes}})
-    await interaction.response.send_message(f"⏱️ Interval set to {minutes} min.")
+    try:
+        if not 1 <= minutes <= 1440:
+            return await interaction.response.send_message("❌ Interval must be between 1 and 1440 minutes.", ephemeral=True)
+        config_col.update_one({"channel_id": interaction.channel_id}, {"$set": {"interval": minutes}})
+        await interaction.response.send_message(f"⏱️ Interval set to {minutes} min.")
+    except Exception as e:
+        await interaction.response.send_message("❌ Error setting interval.", ephemeral=True)
+        await send_error_dm(BOT_OWNER_ID, str(e))
 
-@tree.command(name="setglobalinterval", description="Set global post interval for all channels.")
-@app_commands.describe(minutes="Global minutes between posts")
+@tree.command(
+    name="setglobalinterval",
+    description="Set global post interval for all channels."
+)
+@app_commands.describe(
+    minutes="Global minutes between posts (1-1440)"
+)
+@app_commands.choices(
+    minutes=[
+        app_commands.Choice(name=f"{i} minutes", value=i)
+        for i in [1, 5, 10, 15, 30, 60, 120, 180, 240, 360, 480, 720, 1440]
+    ]
+)
 async def setglobalinterval(interaction: discord.Interaction, minutes: int):
     if not is_admin_or_mod(interaction):
         return await interaction.response.send_message("Admin only.", ephemeral=True)
-    global GLOBAL_POST_INTERVAL
-    GLOBAL_POST_INTERVAL = minutes
-    await interaction.response.send_message(f"🌐 Global interval set to {minutes} min.")
+    try:
+        if not 1 <= minutes <= 1440:
+            return await interaction.response.send_message("❌ Interval must be between 1 and 1440 minutes.", ephemeral=True)
+        global GLOBAL_POST_INTERVAL
+        GLOBAL_POST_INTERVAL = minutes
+        await interaction.response.send_message(f"🌐 Global interval set to {minutes} min.")
+    except Exception as e:
+        await interaction.response.send_message("❌ Error setting global interval.", ephemeral=True)
+        await send_error_dm(BOT_OWNER_ID, str(e))
 
-@tree.command(name="send", description="Manually send a post to this channel.")
-@commands.cooldown(1, 10, commands.BucketType.channel)
+@tree.command(
+    name="send",
+    description="Manually send a post to this channel."
+)
 async def send(interaction: discord.Interaction):
-    cfg = get_config(interaction.channel_id)
-    subs = cfg.get("subs", [])
-    if not subs:
-        return await interaction.response.send_message("❌ No subreddits linked.")
-    sub = subs[datetime.utcnow().second % len(subs)]
-    post = await fetch_post(sub)
-    if not post:
-        return await interaction.response.send_message("⚠️ No valid post found.")
-    embed = await build_embed(post)
-    await interaction.response.send_message(embed=embed)
+    try:
+        cfg = get_config(interaction.channel_id)
+        subs = cfg.get("subs", [])
+        if not subs:
+            return await interaction.response.send_message("❌ No subreddits linked.")
+        
+        await interaction.response.defer(thinking=True)
+        
+        sub = subs[datetime.utcnow().second % len(subs)]
+        post = await fetch_post(sub)
+        if not post:
+            return await interaction.followup.send("⚠️ No valid post found.")
+        embed = await build_embed(post)
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send("❌ Error sending post.", ephemeral=True)
+        await send_error_dm(BOT_OWNER_ID, str(e))
 
-@tree.command(name="forcesend", description="Force send posts to all configured channels.")
-@app_commands.describe(count="How many posts per channel (default 1)")
+@tree.command(
+    name="forcesend",
+    description="Force send posts to all configured channels."
+)
+@app_commands.describe(
+    count="How many posts per channel (1-5)"
+)
+@app_commands.choices(
+    count=[
+        app_commands.Choice(name=str(i), value=i)
+        for i in range(1, 6)
+    ]
+)
 async def forcesend(interaction: discord.Interaction, count: int = 1):
     if not is_admin_or_mod(interaction):
         return await interaction.response.send_message("Admin only.", ephemeral=True)
-    await interaction.response.send_message("⏩ Forcing posts to all channels...")
-    for cfg in config_col.find():
-        channel = bot.get_channel(cfg["channel_id"])
-        if not channel:
-            config_col.delete_one({"channel_id": cfg["channel_id"]})
-            continue
-        for _ in range(count):
+    try:
+        if not 1 <= count <= 5:
+            return await interaction.response.send_message("❌ Count must be between 1 and 5.", ephemeral=True)
+            
+        await interaction.response.defer(thinking=True)
+        
+        success_count = 0
+        fail_count = 0
+        
+        for cfg in config_col.find():
+            channel = bot.get_channel(cfg["channel_id"])
+            if not channel:
+                config_col.delete_one({"channel_id": cfg["channel_id"]})
+                continue
+                
             if "subs" not in cfg or not cfg["subs"]:
                 continue
-            sub = cfg["subs"][datetime.utcnow().second % len(cfg["subs"])]
-            post = await fetch_post(sub)
-            if post:
+                
+            for _ in range(count):
                 try:
-                    embed = await build_embed(post)
-                    await channel.send(embed=embed)
+                    sub = cfg["subs"][datetime.utcnow().second % len(cfg["subs"])]
+                    post = await fetch_post(sub)
+                    if post:
+                        embed = await build_embed(post)
+                        await channel.send(embed=embed)
+                        success_count += 1
                 except Exception:
-                    pass
+                    fail_count += 1
+                    continue
+        
+        await interaction.followup.send(f"✅ Force send complete!\nSuccess: {success_count}\nFailed: {fail_count}")
+    except Exception as e:
+        await interaction.followup.send("❌ Error during force send.", ephemeral=True)
+        await send_error_dm(BOT_OWNER_ID, str(e))
 
 # ─── Auto Poster Task ───────────────────────────────────────────────────────────
 @tasks.loop(minutes=1)
@@ -252,11 +344,19 @@ async def auto_post_loop():
 # ─── Bot Events ─────────────────────────────────────────────────────────────────
 @bot.event
 async def on_ready():
-    await tree.sync(guild=discord.Object(id=GUILD_ID))
-    auto_post_loop.start()
-    logging_channel = bot.get_channel(LOGGING_CHANNEL_ID)
-    if logging_channel:
-        await logging_channel.send(f"✅ Bot restarted at {datetime.utcnow()}")
+    try:
+        # Sync commands globally first
+        await tree.sync()
+        # Then sync to specific guild
+        await tree.sync(guild=discord.Object(id=GUILD_ID))
+        auto_post_loop.start()
+        logging_channel = bot.get_channel(LOGGING_CHANNEL_ID)
+        if logging_channel:
+            await logging_channel.send(f"✅ Bot restarted at {datetime.utcnow()}")
+    except Exception as e:
+        print(f"Error during startup: {e}")
+        if logging_channel:
+            await logging_channel.send(f"⚠️ Error during startup: {e}")
 
 @bot.event
 async def on_command_error(ctx, error):
