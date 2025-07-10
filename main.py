@@ -595,6 +595,7 @@ async def addsub(interaction: discord.Interaction, name: str):
         )
         await send_error_dm(BOT_OWNER_ID, f"Error in addsub for r/{name}: {str(e)}")
 
+# ─── Commands ───────────────────────────────────────────────────────────────────
 @tree.command(
     name="removesub",
     description="Unlink a subreddit from this channel."
@@ -606,8 +607,14 @@ async def removesub(interaction: discord.Interaction, name: str):
     if not is_admin_or_mod(interaction):
         return await interaction.response.send_message("You must be an admin/mod to use this.", ephemeral=True)
     try:
-    config_col.update_one({"channel_id": interaction.channel_id}, {"$pull": {"subs": name.lower()}})
-    await interaction.response.send_message(f"🗑️ Removed r/{name} from this channel.")
+        name = name.strip().lower()
+        if name.startswith('r/'):
+            name = name[2:]
+        config_col.update_one(
+            {"channel_id": interaction.channel_id}, 
+            {"$pull": {"subs": name}}
+        )
+        await interaction.response.send_message(f"🗑️ Removed r/{name} from this channel.")
     except Exception as e:
         await interaction.response.send_message(f"❌ Error removing subreddit: {e}", ephemeral=True)
         await send_error_dm(BOT_OWNER_ID, str(e))
@@ -620,11 +627,14 @@ async def listsubs(interaction: discord.Interaction):
     try:
         await interaction.response.defer(thinking=True)
         
-    cfg = get_config(interaction.channel_id)
-    subs = cfg.get("subs", [])
-    if not subs:
+        cfg = get_config(interaction.channel_id)
+        subs = cfg.get("subs", [])
+        
+        if not subs:
             return await interaction.followup.send("❌ No subreddits linked.")
-        await interaction.followup.send("📜 Subreddits:\n" + "\n".join(f"- r/{s}" for s in subs))
+            
+        sub_list = "\n".join(f"- r/{s}" for s in sorted(subs))
+        await interaction.followup.send(f"📜 Subreddits:\n{sub_list}")
     except Exception as e:
         print(f"Error in listsubs: {e}")
         await interaction.followup.send("❌ Error listing subreddits.", ephemeral=True)
@@ -649,8 +659,11 @@ async def setinterval(interaction: discord.Interaction, minutes: int):
     try:
         if not 1 <= minutes <= 1440:
             return await interaction.response.send_message("❌ Interval must be between 1 and 1440 minutes.", ephemeral=True)
-    config_col.update_one({"channel_id": interaction.channel_id}, {"$set": {"interval": minutes}})
-    await interaction.response.send_message(f"⏱️ Interval set to {minutes} min.")
+        config_col.update_one(
+            {"channel_id": interaction.channel_id},
+            {"$set": {"interval": minutes}}
+        )
+        await interaction.response.send_message(f"⏱️ Interval set to {minutes} min.")
     except Exception as e:
         await interaction.response.send_message("❌ Error setting interval.", ephemeral=True)
         await send_error_dm(BOT_OWNER_ID, str(e))
@@ -674,9 +687,9 @@ async def setglobalinterval(interaction: discord.Interaction, minutes: int):
     try:
         if not 1 <= minutes <= 1440:
             return await interaction.response.send_message("❌ Interval must be between 1 and 1440 minutes.", ephemeral=True)
-    global GLOBAL_POST_INTERVAL
-    GLOBAL_POST_INTERVAL = minutes
-    await interaction.response.send_message(f"🌐 Global interval set to {minutes} min.")
+        global GLOBAL_POST_INTERVAL
+        GLOBAL_POST_INTERVAL = minutes
+        await interaction.response.send_message(f"🌐 Global interval set to {minutes} min.")
     except Exception as e:
         await interaction.response.send_message("❌ Error setting global interval.", ephemeral=True)
         await send_error_dm(BOT_OWNER_ID, str(e))
@@ -689,17 +702,17 @@ async def send(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True)
     
     try:
-    cfg = get_config(interaction.channel_id)
-    subs = cfg.get("subs", [])
-    if not subs:
+        cfg = get_config(interaction.channel_id)
+        subs = cfg.get("subs", [])
+        if not subs:
             return await interaction.followup.send("❌ No subreddits linked.")
         
         sub = subs[datetime.now(UTC).second % len(subs)]
-    post = await fetch_post(sub)
-    if not post:
+        post = await fetch_post(sub)
+        if not post:
             return await interaction.followup.send("⚠️ No valid post found.")
         
-    embed = await build_embed(post)
+        embed = await build_embed(post)
         if not embed:
             return await interaction.followup.send("⚠️ Failed to create embed.")
             
@@ -735,11 +748,11 @@ async def forcesend(interaction: discord.Interaction, count: int = 1):
         success_count = 0
         fail_count = 0
         
-    for cfg in config_col.find():
-        channel = bot.get_channel(cfg["channel_id"])
-        if not channel:
-            config_col.delete_one({"channel_id": cfg["channel_id"]})
-            continue
+        for cfg in config_col.find():
+            channel = bot.get_channel(cfg["channel_id"])
+            if not channel:
+                config_col.delete_one({"channel_id": cfg["channel_id"]})
+                continue
                 
             if "subs" not in cfg or not cfg["subs"]:
                 continue
@@ -749,9 +762,9 @@ async def forcesend(interaction: discord.Interaction, count: int = 1):
                     sub = cfg["subs"][datetime.now(UTC).second % len(cfg["subs"])]
                     post = await fetch_post(sub)
                     if post:
-                    embed = await build_embed(post)
+                        embed = await build_embed(post)
                         if embed:
-                    await channel.send(embed=embed)
+                            await channel.send(embed=embed)
                             success_count += 1
                 except Exception as e:
                     print(f"Error in forcesend for r/{sub}: {e}")
@@ -769,33 +782,33 @@ async def forcesend(interaction: discord.Interaction, count: int = 1):
 async def auto_post_loop():
     for cfg in config_col.find():
         try:
-        channel_id = cfg["channel_id"]
-        interval = cfg.get("interval", GLOBAL_POST_INTERVAL)
+            channel_id = cfg["channel_id"]
+            interval = cfg.get("interval", GLOBAL_POST_INTERVAL)
             last_time = LAST_SENT.get(channel_id, datetime.min.replace(tzinfo=UTC))
             
             if datetime.now(UTC) - last_time < timedelta(minutes=interval):
-            continue
+                continue
                 
-        channel = bot.get_channel(channel_id)
-        if not channel:
-            config_col.delete_one({"channel_id": channel_id})
-            continue
+            channel = bot.get_channel(channel_id)
+            if not channel:
+                config_col.delete_one({"channel_id": channel_id})
+                continue
                 
-        if not cfg.get("subs"):
-            continue
+            if not cfg.get("subs"):
+                continue
                 
             sub = cfg["subs"][datetime.now(UTC).second % len(cfg["subs"])]
-        post = await fetch_post(sub)
-        if post:
+            post = await fetch_post(sub)
+            if post:
                 embed = await build_embed(post)
                 if embed:
-                await channel.send(embed=embed)
+                    await channel.send(embed=embed)
                     LAST_SENT[channel_id] = datetime.now(UTC)
                     await save_last_sent()
                     await update_channel_stats(channel_id, post.url, str(post.subreddit))
         except Exception as e:
             print(f"Error in auto_post_loop: {e}")
-                continue
+            continue
 
 @tree.command(
     name="channelstats",
@@ -864,16 +877,16 @@ async def on_ready():
             print(f"Error syncing commands: {sync_error}")
         
         # Start auto posting
-    auto_post_loop.start()
+        auto_post_loop.start()
         
     logging_channel = bot.get_channel(LOGGING_CHANNEL_ID)
     if logging_channel:
-            status = "✅" if auth_success else "⚠️"
-            await logging_channel.send(
-                f"{status} Bot restarted at {datetime.now(UTC)}\n"
-                f"Reddit auth test: {'Success' if auth_success else 'Failed'}\n"
-                f"MongoDB status: {'Initialized' if await init_mongodb() else 'Failed'}"
-            )
+        status = "✅" if auth_success else "⚠️"
+        await logging_channel.send(
+            f"{status} Bot restarted at {datetime.now(UTC)}\n"
+            f"Reddit auth test: {'Success' if auth_success else 'Failed'}\n"
+            f"MongoDB status: {'Initialized' if await init_mongodb() else 'Failed'}"
+        )
         print("Bot is ready!")
     except Exception as e:
         print(f"Error during startup: {e}")
