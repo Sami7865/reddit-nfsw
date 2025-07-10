@@ -1,5 +1,10 @@
-# requirements.txt for discord.py NSFW Reddit bot (no voice, no py-cord)
+# requirements.txt for discord.py NSFW Reddit bot
 discord.py==2.3.2
 asyncpraw==7.7.1
 pymongo==4.7.2
 Flask==3.0.3
+aiohttp==3.9.3
+requests==2.31.0
+python-dotenv==1.0.1
+dnspython==2.6.1  # Required for pymongo srv URLs
+gunicorn==21.2.0  # For production web server
