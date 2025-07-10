@@ -96,7 +96,7 @@ async def setup_reddit():
     session = aiohttp.ClientSession(timeout=timeout)
     
     # Initialize Reddit client with script-type user agent
-    USER_AGENT = f"script:discord.nsfw.bot:v1.0 (by /u/{REDDIT_USERNAME})"
+    USER_AGENT = f"render:discord.nsfw.bot:v1.0 (by /u/{REDDIT_USERNAME})"
     print(f"User Agent: {USER_AGENT}")
     
     reddit = asyncpraw.Reddit(
@@ -525,10 +525,60 @@ async def cleanup():
     if session:
         await session.close()
 
-# ─── Run Bot ────────────────────────────────────────────────────────────────────
-def run_bot():
-    """Run the bot with proper async handling"""
+async def test_reddit_auth():
+    """Test Reddit authentication by attempting to access user info"""
     try:
+        if reddit is None:
+            await setup_reddit()
+        me = await reddit.user.me()
+        print(f"Reddit auth test successful - logged in as: {me.name}")
+        return True
+    except Exception as e:
+        print(f"Reddit auth test failed: {e}")
+        return False
+
+# ─── Run Bot ────────────────────────────────────────────────────────────────────
+async def start_bot():
+    """Start the bot with proper error handling"""
+    retries = 0
+    max_retries = 5
+    retry_delay = 60  # seconds
+
+    while retries < max_retries:
+        try:
+            print(f"Starting bot (attempt {retries + 1}/{max_retries})...")
+            await bot.start(TOKEN)
+            break
+        except LoginFailure as e:
+            retries += 1
+            print(f"Failed to login (attempt {retries}/{max_retries}): {e}")
+            if retries < max_retries:
+                wait_time = retry_delay * retries
+                print(f"Waiting {wait_time} seconds before retrying...")
+                await asyncio.sleep(wait_time)
+            else:
+                print("Max retries reached. Exiting...")
+                sys.exit(1)
+        except Exception as e:
+            retries += 1
+            print(f"Unexpected error (attempt {retries}/{max_retries}): {e}")
+            if retries < max_retries:
+                wait_time = retry_delay * retries
+                print(f"Waiting {wait_time} seconds before retrying...")
+                await asyncio.sleep(wait_time)
+            else:
+                print("Max retries reached. Exiting...")
+                sys.exit(1)
+
+def main():
+    """Main entry point for the bot"""
+    try:
+        # Start Flask in a separate thread
+        flask_thread = Thread(target=run_flask)
+        flask_thread.daemon = True  # This ensures the Flask thread stops when the main program stops
+        flask_thread.start()
+        
+        # Start the bot
         asyncio.run(start_bot())
     except KeyboardInterrupt:
         print("Bot stopped by user")
@@ -537,7 +587,4 @@ def run_bot():
         sys.exit(1)
 
 if __name__ == "__main__":
-    # Start Flask in a separate thread
-    Thread(target=run_flask).start()
-    # Run the bot
-    run_bot()
+    main()
