@@ -84,13 +84,16 @@ config_col = db["configs"]
 
 # ─── Reddit Client ──────────────────────────────────────────────────────────────────
 import aiohttp
-
-# Create custom session with longer timeout
-session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
+import asyncio
+from contextlib import asynccontextmanager
 
 # Initialize Reddit client with Render-specific user agent
-USER_AGENT = f"render:discord.nsfw.bot:v1.0 (by /u/{REDDIT_USERNAME})"
+USER_AGENT = f"script:discord.nsfw.bot:v1.0 (by /u/{REDDIT_USERNAME})"
 print(f"User Agent: {USER_AGENT}")
+
+# Create custom session with proper configuration
+timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=10)
+session = aiohttp.ClientSession(timeout=timeout)
 
 reddit = asyncpraw.Reddit(
     client_id=REDDIT_CLIENT_ID,
@@ -100,6 +103,73 @@ reddit = asyncpraw.Reddit(
     user_agent=USER_AGENT,
     requestor_kwargs={"session": session}
 )
+
+@asynccontextmanager
+async def get_subreddit(name: str):
+    """Safely get a subreddit with proper timeout handling."""
+    try:
+        sub = await reddit.subreddit(name)
+        yield sub
+    except Exception as e:
+        print(f"Error accessing subreddit r/{name}: {e}")
+        raise
+
+async def verify_subreddit_access(sub_name: str):
+    """Verify if we can access a subreddit and log detailed error info."""
+    try:
+        print(f"\nTesting access to r/{sub_name}")
+        
+        async def _verify():
+            async with get_subreddit(sub_name) as sub:
+                async for post in sub.new(limit=1):
+                    return True
+            return False
+            
+        # Create and run task with timeout
+        task = asyncio.create_task(_verify())
+        result = await asyncio.wait_for(task, timeout=30.0)
+        
+        if result:
+            print(f"Successfully accessed r/{sub_name}")
+            return True, None
+        else:
+            print(f"No posts found in r/{sub_name}")
+            return False, "Subreddit exists but has no posts"
+            
+    except asyncio.TimeoutError:
+        print(f"Timeout accessing r/{sub_name}")
+        return False, "Request timed out - please try again"
+    except Exception as e:
+        print(f"Error verifying access: {e}")
+        return False, str(e)
+
+async def fetch_post(subreddit: str):
+    """Fetch a media post from the subreddit."""
+    try:
+        async def _fetch():
+            async with get_subreddit(subreddit) as sub:
+                async for post in sub.hot(limit=25):
+                    if post.stickied:
+                        continue
+                    if post.url.endswith((".jpg", ".png", ".gif", ".jpeg", ".webm", ".mp4")) or "v.redd.it" in post.url:
+                        return post
+                return None
+
+        # Create and run task with timeout
+        task = asyncio.create_task(_fetch())
+        post = await asyncio.wait_for(task, timeout=30.0)
+        
+        if post:
+            return post
+        print(f"No media posts found in r/{subreddit}")
+        return None
+        
+    except asyncio.TimeoutError:
+        print(f"Timeout fetching posts from r/{subreddit}")
+        return None
+    except Exception as e:
+        print(f"Error fetching post: {e}")
+        return None
 
 # Test Reddit authentication immediately
 async def test_reddit_auth():
@@ -153,68 +223,6 @@ async def on_ready():
         print(f"Error during startup: {e}")
         if 'logging_channel' in locals() and logging_channel:
             await logging_channel.send(f"⚠️ Error during startup: {e}")
-
-async def verify_subreddit_access(sub_name: str):
-    """Verify if we can access a subreddit and log detailed error info."""
-    try:
-        print(f"\nTesting access to r/{sub_name}:")
-        print("1. Getting subreddit instance...")
-        sub = await reddit.subreddit(sub_name)
-        
-        print("2. Attempting to get subreddit info...")
-        try:
-            # Try to get basic info first
-            await sub.load()
-            print(f"Subreddit info loaded: over18={getattr(sub, 'over18', 'unknown')}")
-        except Exception as e:
-            print(f"Note: Could not load subreddit info: {e}")
-            # Continue anyway as this isn't critical
-        
-        print("3. Testing post access...")
-        try:
-            async for post in sub.new(limit=1):
-                print("Successfully got a post!")
-                return True, None
-            print("No posts found")
-            return False, "Subreddit exists but has no posts"
-        except Exception as e:
-            print(f"Error accessing posts: {e}")
-            return False, str(e)
-
-    except Exception as e:
-        print(f"Error in verify_subreddit_access: {e}")
-        return False, str(e)
-
-async def fetch_post(subreddit: str):
-    try:
-        # Create a task for fetching posts
-        async def get_posts():
-            sub = await reddit.subreddit(subreddit)
-            async for post in sub.hot(limit=25):
-                if post.stickied:
-                    continue
-                if post.url.endswith((".jpg", ".png", ".gif", ".jpeg", ".webm", ".mp4")) or "v.redd.it" in post.url:
-                    return post
-            return None
-
-        # Run the task with timeout
-        try:
-            task = asyncio.create_task(get_posts())
-            post = await asyncio.wait_for(task, timeout=30.0)
-            if post:
-                return post
-            print(f"No media posts found in r/{subreddit}")
-            return None
-        except asyncio.TimeoutError:
-            print(f"Timeout fetching posts from r/{subreddit}")
-            return None
-        except Exception as e:
-            print(f"Error fetching posts: {e}")
-            return None
-
-    except Exception as e:
-        print(f"Error in fetch_post: {e}")
-        return None
 
 # ─── Globals ────────────────────────────────────────────────────────────────────
 GLOBAL_POST_INTERVAL = 30  # default to 30 minutes
@@ -270,7 +278,7 @@ async def addsub(interaction: discord.Interaction, name: str):
         if name.startswith('r/'):
             name = name[2:]
             
-        print(f"Attempting to add subreddit: r/{name}")
+        print(f"\nAttempting to add subreddit: r/{name}")
         
         # First verify we can access the subreddit
         can_access, error_msg = await verify_subreddit_access(name)
